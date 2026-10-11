@@ -1,6 +1,5 @@
-# Optional: only needed for training your own ONNX models
-# (CPU build; works everywhere. For CUDA training, install the matching
-#  torch build from https://pytorch.org instead.)
+# Training (CPU / generic). GPU users: use the vendor-specific file instead:
+#   requirements-train-nvidia.txt | -amd.txt | -intel.txt
 -r requirements.txt
 torch>=2.4
 onnxscript>=0.2

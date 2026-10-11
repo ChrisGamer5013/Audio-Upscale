@@ -1,0 +1,7 @@
+# Training on Intel GPUs (Arc A/B series, Core Ultra iGPU) via PyTorch XPU.
+# Official PyTorch XPU wheels (Windows 11, train + inference, torch >= 2.5).
+-r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/xpu
+torch
+onnxscript>=0.2
+onnx>=1.17

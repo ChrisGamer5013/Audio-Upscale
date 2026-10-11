@@ -1,0 +1,9 @@
+# Training on AMD GPUs via ROCm. On Windows AMD ships ROCm PyTorch wheels
+# via its own index (ROCm 10.x supports Python 3.10-3.14; RDNA3/RDNA4 GPUs).
+# If your pip is too old for wheel variants, follow the manual wheel URLs at
+# https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/windows/install-pytorch.html
+-r requirements.txt
+--extra-index-url https://stable.repo.amd.com/rocm/whl-next/
+torch
+onnxscript>=0.2
+onnx>=1.17

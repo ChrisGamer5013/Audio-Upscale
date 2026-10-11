@@ -29,9 +29,53 @@ def _require_torch():
     except ImportError as exc:
         raise RuntimeError(
             "PyTorch is required for training but is not installed.\n"
-            "Run:  .venv\\Scripts\\python -m pip install -r requirements-train.txt"
+            "Pick your GPU vendor and run one of:\n"
+            "  CPU / generic : pip install -r requirements-train.txt\n"
+            "  NVIDIA CUDA   : pip install -r requirements-train-nvidia.txt\n"
+            "  AMD ROCm      : pip install -r requirements-train-amd.txt\n"
+            "  Intel XPU     : pip install -r requirements-train-intel.txt"
         ) from exc
     return torch, nn
+
+
+def detect_device(torch, preference: str | None = None, log=print):
+    """Pick a training device: cuda (NVIDIA *and* AMD ROCm builds), xpu
+    (Intel), dml (torch-directml), or cpu. Probes with a real fwd/bwd pass
+    and falls back to CPU if the backend errors."""
+    if preference and preference != "auto":
+        return torch.device(preference)
+
+    candidates: list[tuple[str, object, str]] = []
+    if torch.cuda.is_available():
+        hip = getattr(torch.version, "hip", None)
+        label = f"ROCm {hip} (AMD)" if hip else "CUDA (NVIDIA)"
+        candidates.append(("cuda", torch.device("cuda"), label))
+    if getattr(torch, "xpu", None) is not None and torch.xpu.is_available():
+        candidates.append(("xpu", torch.device("xpu"), "XPU (Intel)"))
+    try:
+        import torch_directml  # optional, legacy vendor-neutral backend
+
+        candidates.append(("dml", torch_directml.device(), "DirectML"))
+    except ImportError:
+        pass
+    candidates.append(("cpu", torch.device("cpu"), "CPU"))
+
+    for name, dev, label in candidates:
+        try:
+            torch.nn.functional.gelu(torch.zeros(1, 1, 64, device=dev))
+            probe = torch.nn.Conv1d(1, 4, 3, padding=1).to(dev)
+            out = probe(torch.zeros(1, 1, 64, device=dev))
+            out.sum().backward()
+            torch.stft(torch.zeros(512, device=dev), 64, hop_length=16,
+                       window=torch.hann_window(64, device=dev),
+                       return_complex=True)
+            log(f"training device: {label}")
+            return dev
+        except Exception as exc:
+            if name == "cpu":
+                raise
+            log(f"  {label} unusable ({exc.__class__.__name__}) - trying next")
+    return torch.device("cpu")
 
 
 # ---------------------------------------------------------------- model
@@ -135,7 +179,7 @@ def train(data_folder: Path, out_model: Path, sr: int = 48_000,
           log=print) -> Path:
     torch, nn = _require_torch()
 
-    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    dev = detect_device(torch, device or "auto", log)
     log(f"device={dev}  sr={sr}  chunk={chunk}  batch={batch}")
 
     model = build_model(torch, nn).to(dev)

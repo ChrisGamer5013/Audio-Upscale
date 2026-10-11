@@ -18,7 +18,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--steps", type=int, default=400, help="steps per epoch")
-    p.add_argument("--device", default=None, help="'cpu', 'cuda', ... (auto)")
+    p.add_argument("--device", default="auto",
+                   choices=["auto", "cpu", "cuda", "xpu", "dml"],
+                   help="training backend: cuda = NVIDIA or AMD ROCm build, "
+                        "xpu = Intel GPU, dml = torch-directml (default: auto)")
     return p
 
 

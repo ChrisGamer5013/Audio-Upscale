@@ -12,8 +12,9 @@ Language: Python 3.14 (`.venv`). Working dir is the project root.
 - CLI: `.venv\Scripts\python main.py cli --help`
 - Tests: `.venv\Scripts\python -m pytest tests -q`
 - Demo file: `.venv\Scripts\python scripts\make_demo.py`
-- Train ONNX model: `.venv\Scripts\python -m pip install -r requirements-train.txt`
-  then `main.py train <audio_folder> --epochs N` (writes to `models/`)
+- Train ONNX model: install one of `requirements-train[-nvidia|-amd|-intel].txt`
+  (torch CPU / CUDA / ROCm / XPU), then `main.py train <audio_folder> --epochs N`
+  (writes to `models/`; `--device auto|cpu|cuda|xpu|dml`)
 - Build portable exe: `.venv\Scripts\python scripts\build_portable.py`
   (PyInstaller onedir + onefile `dist/AudioUpscalerHD-standalone.exe`;
   Inno Setup installer when available)

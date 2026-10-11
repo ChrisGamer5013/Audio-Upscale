@@ -64,14 +64,26 @@ REM -> dist\AudioUpscalerHD-portable.zip    (portable folder)
 
 ## Train your own ONNX model
 
+Pick the training backend for your GPU (each replaces the plain torch):
+
 ```bat
-.venv\Scripts\python -m pip install -r requirements-train.txt
+REM NVIDIA (CUDA):  pip install -r requirements-train-nvidia.txt
+REM AMD (ROCm):     pip install -r requirements-train-amd.txt
+REM Intel (XPU):    pip install -r requirements-train-intel.txt
+REM any CPU:        pip install -r requirements-train.txt
+```
+
+Then:
+
+```bat
 .venv\Scripts\python main.py train "D:\path\to\your\music" --epochs 20
 REM -> models\upscaler_48000.onnx -- select it in the GUI (engine: ONNX)
 ```
 
-Training pairs are generated on the fly by low-passing your high-quality
-audio to random cutoffs, so any folder of good WAV/FLAC files works.
+The trainer auto-detects CUDA (NVIDIA or AMD ROCm builds), XPU (Intel)
+and torch-directml, probing each backend and falling back to CPU if
+needed (`--device` overrides). Training pairs are generated on the fly by
+low-passing your high-quality audio, so any folder of WAV/FLAC works.
 
 ---
 

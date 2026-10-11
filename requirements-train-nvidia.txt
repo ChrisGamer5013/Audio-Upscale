@@ -1,0 +1,6 @@
+# Training on NVIDIA GPUs (CUDA). Install FIRST this, it replaces the CPU torch.
+-r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch
+onnxscript>=0.2
+onnx>=1.17
