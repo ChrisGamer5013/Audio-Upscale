@@ -54,9 +54,13 @@ OUTPUT_FORMATS: dict[str, OutputFormat] = {
 }
 
 
-_LOCAL_BIN = (
-    Path(__file__).resolve().parent.parent / "tools" / "ffmpeg" / "bin"
-)
+def _local_bin() -> Path:
+    if getattr(__import__("sys"), "frozen", False):
+        return Path(__import__("sys").executable).resolve().parent / "tools" / "ffmpeg" / "bin"
+    return Path(__file__).resolve().parent.parent / "tools" / "ffmpeg" / "bin"
+
+
+_LOCAL_BIN = _local_bin()
 
 
 def ffmpeg_path() -> str | None:

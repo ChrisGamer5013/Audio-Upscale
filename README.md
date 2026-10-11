@@ -49,6 +49,32 @@ into `tools\ffmpeg`).
 
 ---
 
+## Portable / installer (no Python needed)
+
+Download `AudioUpscalerHD-standalone.exe` (or `-portable.zip`) from
+[Releases](https://github.com/ChrisGamer5013/Audio-Upscale/releases).
+Run it anywhere — on first launch it auto-downloads ffmpeg. Or build it
+yourself:
+
+```bat
+.venv\Scripts\python scripts\build_portable.py
+REM -> dist\AudioUpscalerHD-standalone.exe  (single-file, all-in-one)
+REM -> dist\AudioUpscalerHD-portable.zip    (portable folder)
+```
+
+## Train your own ONNX model
+
+```bat
+.venv\Scripts\python -m pip install -r requirements-train.txt
+.venv\Scripts\python main.py train "D:\path\to\your\music" --epochs 20
+REM -> models\upscaler_48000.onnx -- select it in the GUI (engine: ONNX)
+```
+
+Training pairs are generated on the fly by low-passing your high-quality
+audio to random cutoffs, so any folder of good WAV/FLAC files works.
+
+---
+
 ## Project layout
 
 ```

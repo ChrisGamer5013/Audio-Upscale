@@ -16,6 +16,21 @@ def main() -> int:
         from audio_upscaler.cli import run_cli
 
         return run_cli(args[1:])
+    if args and args[0].lower() == "train":
+        from audio_upscaler.train_cli import run_train
+
+        return run_train(args[1:])
+
+    # first run of a frozen (PyInstaller) build: fetch missing tools
+    if getattr(sys, "frozen", False):
+        try:
+            from audio_upscaler.bootstrap import ensure_ffmpeg, ffmpeg_available
+
+            if not ffmpeg_available():
+                print("First run: downloading ffmpeg (one-time) ...")
+                ensure_ffmpeg()
+        except Exception as exc:  # never block startup
+            print(f"bootstrap warning: {exc}")
 
     # default: GUI
     try:

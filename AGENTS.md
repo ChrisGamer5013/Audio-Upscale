@@ -12,6 +12,11 @@ Language: Python 3.14 (`.venv`). Working dir is the project root.
 - CLI: `.venv\Scripts\python main.py cli --help`
 - Tests: `.venv\Scripts\python -m pytest tests -q`
 - Demo file: `.venv\Scripts\python scripts\make_demo.py`
+- Train ONNX model: `.venv\Scripts\python -m pip install -r requirements-train.txt`
+  then `main.py train <audio_folder> --epochs N` (writes to `models/`)
+- Build portable exe: `.venv\Scripts\python scripts\build_portable.py`
+  (PyInstaller onedir + onefile `dist/AudioUpscalerHD-standalone.exe`;
+  Inno Setup installer when available)
 
 ## Structure
 
@@ -31,6 +36,11 @@ Language: Python 3.14 (`.venv`). Working dir is the project root.
   `tkinterdnd2` when installed.
 - `audio_upscaler/cli.py`, `providers.py` (GPU detection via WMI +
   onnxruntime EPs), `presets.py`, `spectrogram.py` (matplotlib Agg).
+- `audio_upscaler/training.py` + `train_cli.py` — PyTorch training of a
+  small dilated-conv super-res net, exports dynamic-time-axis ONNX. Torch is
+  an optional dep (`requirements-train.txt`); guard with lazy import.
+- `audio_upscaler/bootstrap.py` — ffmpeg auto-installer; also called on
+  first run of the frozen exe. `scripts/install_ffmpeg.py` wraps it.
 - `models/` — user-supplied `.onnx` models (see `models/README.md`).
 
 ## Conventions
@@ -41,7 +51,8 @@ Language: Python 3.14 (`.venv`). Working dir is the project root.
 - DSP engine must stay pure-CPU and dependency-light; GPU code lives only in
   `onnx_engine.py` behind a guarded `import onnxruntime`.
 - ffmpeg must remain optional: core WAV/FLAC/MP3/OGG workflows work without
-  it; check via `audio_io.ffmpeg_path()`.
+  it; check via `audio_io.ffmpeg_path()`; frozen builds look in
+  `<exe_dir>/tools/ffmpeg/bin` first (bootstrap installs there).
 - Progress UX: engines report `progress(frac, message)`; pipeline maps to
   `(file_index, total, frac, message, path)`; GUI polls a `queue.Queue`.
 - Adding dependencies → update `requirements.txt` **and this file** if the
