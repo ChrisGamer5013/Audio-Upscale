@@ -476,6 +476,10 @@ class App(ctk.CTk):
                     self.cancel_btn.configure(state="disabled")
                     self.progress_lbl.configure(text=f"Error: {msg[1]}")
                     messagebox.showerror("Error", msg[1])
+                elif kind == "preview":
+                    self._show_preview(msg[1], msg[2])
+                elif kind == "preview_err":
+                    messagebox.showerror("Preview failed", msg[1])
         except queue.Empty:
             pass
         self.after(80, self._poll_queue)
@@ -555,21 +559,8 @@ class App(ctk.CTk):
             ctk.CTkLabel(top, text=f"Could not show image: {exc}").pack(padx=20, pady=20)
         top.lift()
 
-    # note: extend _poll_queue by monkey-patching preview messages
-    _orig_poll = _poll_queue
 
-    def _poll_queue(self) -> None:
-        try:
-            while True:
-                msg = self._msg_q.get_nowait()
-                if msg[0] == "preview":
-                    self._show_preview(msg[1], msg[2])
-                elif msg[0] == "preview_err":
-                    messagebox.showerror("Preview failed", msg[1])
-                else:
-                    # fall through to base behaviour by re-queuing
-                    self._msg_q.put(msg)
-                    break
-        except queue.Empty:
-            pass
-        self._orig_poll()
+def launch() -> None:
+    """Create the main window and run the Tk event loop."""
+    App().mainloop()
+
