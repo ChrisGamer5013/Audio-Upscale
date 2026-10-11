@@ -18,6 +18,7 @@ dist/
 
 # Trained models & demo outputs (keep models/README.md)
 models/*.onnx
+models/*.onnx.data
 demo_*.wav
 demo_*.flac
 demo_*.png
