@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environment (recreated by setup_env.bat)
+.venv/
+venv/
+
+# Local ffmpeg binaries (auto-downloaded by scripts/install_ffmpeg.py)
+tools/ffmpeg/
+
+# Build artifacts
+build/
+dist/
+*.spec.bak
+
+# Trained models & demo outputs (keep models/README.md)
+models/*.onnx
+demo_*.wav
+demo_*.flac
+demo_*.png
+*.compare.png
+
+# OS junk
+Thumbs.db
+Desktop.ini

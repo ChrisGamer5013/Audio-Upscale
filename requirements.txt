@@ -1,0 +1,23 @@
+# Core DSP
+numpy>=2.1
+scipy>=1.14
+soundfile>=0.13
+pyloudnorm>=0.1.1
+
+# GPU inference (AMD / Intel / NVIDIA via DirectML on Windows)
+onnxruntime-directml>=1.20; platform_system == "Windows"
+onnxruntime>=1.20; platform_system != "Windows"
+
+# GUI
+customtkinter>=5.2
+Pillow>=10.0
+tkinterdnd2>=0.4
+
+# Visualizations
+matplotlib>=3.9
+
+# CLI niceties
+tqdm>=4.66
+
+# Tests
+pytest>=8.0
