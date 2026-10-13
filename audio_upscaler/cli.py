@@ -47,6 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also save before/after spectrogram PNGs")
     p.add_argument("--gpu-info", action="store_true",
                    help="print detected GPUs / acceleration and exit")
+    p.add_argument("--recommend-models", action="store_true",
+                   help="print VRAM-aware ONNX model recommendations and exit")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
 
@@ -71,6 +73,12 @@ def run_cli(argv: list[str]) -> int:
         from .providers import describe, summarize
 
         print(describe(summarize()))
+        return 0
+
+    if args.recommend_models:
+        from .recommendations import recommendation_report
+
+        print(recommendation_report())
         return 0
 
     files = collect_audio_files(args.inputs or [])

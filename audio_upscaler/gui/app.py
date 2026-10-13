@@ -165,12 +165,22 @@ class App(ctk.CTk):
         dev_lbl.pack(anchor="w", pady=(6, 0))
         self.device_var = tk.StringVar(value="0")
         ctk.CTkEntry(self.model_frame, textvariable=self.device_var, width=60).pack(anchor="w")
+        from ..recommendations import gpu_vram_map
+        vram = dict(gpu_vram_map())
         if hw:
-            gtxt = "\n".join(f"  [{i}] {g.name}" for i, g in enumerate(hw))
+            lines = []
+            for i, g in enumerate(hw):
+                gb = vram.get(g.name, 0.0)
+                lines.append(f"  [{i}] {g.name}" + (f" ({gb:g} GB)" if gb else ""))
+            gtxt = "\n".join(lines)
         else:
             gtxt = "  (no GPU detected)"
         ctk.CTkLabel(self.model_frame, text=gtxt, justify="left",
                      text_color="#999", font=ctk.CTkFont(size=11)).pack(anchor="w")
+        ctk.CTkButton(
+            self.model_frame, text="Model recommendations (VRAM-aware)",
+            command=self._show_recommendations,
+        ).pack(anchor="w", pady=(6, 0))
 
         # preset
         label("Preset (DSP engine)")
@@ -480,9 +490,33 @@ class App(ctk.CTk):
                     self._show_preview(msg[1], msg[2])
                 elif kind == "preview_err":
                     messagebox.showerror("Preview failed", msg[1])
+                elif kind == "reco":
+                    try:
+                        self._reco_box.configure(state="normal")
+                        self._reco_box.delete("0.0", "end")
+                        self._reco_box.insert("0.0", msg[1])
+                        self._reco_box.configure(state="disabled")
+                    except Exception:
+                        pass
         except queue.Empty:
             pass
         self.after(80, self._poll_queue)
+
+    def _show_recommendations(self) -> None:
+        top = ctk.CTkToplevel(self)
+        top.title("Model recommendations")
+        top.geometry("780x600")
+        box = ctk.CTkTextbox(top, wrap="word", font=ctk.CTkFont(size=12))
+        box.pack(fill="both", expand=True, padx=10, pady=10)
+        box.insert("0.0", "Detecting GPU VRAM…")
+        box.configure(state="disabled")
+        self._reco_box = box
+
+        def work():
+            from ..recommendations import recommendation_report
+            self._msg_q.put(("reco", recommendation_report()))
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ------------------------------------------------------------------ preview
     def _preview(self) -> None:

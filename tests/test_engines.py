@@ -105,13 +105,66 @@ def test_collect_audio_files(tmp_path):
     assert "a.wav" in names and "c.flac" in names and "b.txt" not in names
 
 
+def _make_identity_model(path: Path, shape: list, name: str) -> None:
+    onnx = pytest.importorskip("onnx")
+    x = onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    y = onnx.helper.make_tensor_value_info("output", onnx.TensorProto.FLOAT, shape)
+    node = onnx.helper.make_node("Identity", [name], ["output"])
+    graph = onnx.helper.make_graph([node], "g", [x], [y])
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.save(model, str(path))
+
+
 @pytest.mark.skipif(
     not engine_status()["onnx"].startswith("ready"),
     reason="onnxruntime not installed",
 )
-def test_onnx_engine_availability():
-    # only checks the runtime can be imported; actual inference needs a model
-    import onnxruntime as ort  # noqa: F401
+def test_onnx_waveform_identity_runs(tmp_path):
+    from audio_upscaler.engines.onnx_engine import OnnxEngine
+
+    m = tmp_path / "id.onnx"
+    _make_identity_model(m, [1, 1, None], "wave")
+    eng = OnnxEngine(m)
+    assert eng.kind == "waveform"
+    x = _sweep(22_050, 0.2)
+    out = eng.process(x, 22_050, 48_000, get_preset("reference"))
+    assert out.sr == 48_000 and np.isfinite(out.audio).all()
+    assert "kind: waveform" in out.notes
+
+
+@pytest.mark.skipif(
+    not engine_status()["onnx"].startswith("ready"),
+    reason="onnxruntime not installed",
+)
+def test_onnx_mel2mel_identity_runs(tmp_path):
+    from audio_upscaler.engines.onnx_engine import OnnxEngine
+
+    m = tmp_path / "mel_id.onnx"
+    _make_identity_model(m, [1, 80, None], "mel")
+    eng = OnnxEngine(m)
+    assert eng.kind == "mel2mel"
+    x = _sweep(44_100, 0.25)
+    out = eng.process(x, 44_100, 48_000, get_preset("reference"))
+    assert out.sr == 48_000 and np.isfinite(out.audio).all()
+    assert out.audio.shape[-1] > 0
+
+
+@pytest.mark.skipif(
+    not engine_status()["onnx"].startswith("ready"),
+    reason="onnxruntime not installed",
+)
+def test_onnx_stft_mask_identity_runs(tmp_path):
+    from audio_upscaler.engines.onnx_engine import OnnxEngine
+
+    m = tmp_path / "mask_id.onnx"
+    _make_identity_model(m, [1, 513, None], "noisy_mag")
+    eng = OnnxEngine(m)
+    assert eng.kind == "stft2stft"
+    x = _sweep(44_100, 0.25)
+    out = eng.process(x, 44_100, 48_000, get_preset("reference"))
+    assert out.sr == 48_000 and np.isfinite(out.audio).all()
 
 
 def test_provider_summary():

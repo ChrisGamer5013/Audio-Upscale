@@ -15,6 +15,9 @@ High-quality audio super-resolution / bandwidth extension for Windows.
 - **Formats out:** WAV (16/24/32-float), FLAC (16/24), MP3, OGG Vorbis,
   OPUS (needs ffmpeg).
 - **Presets:** Music / Voice / Restore old recording / Reference (resample only).
+- **Generic ONNX runner:** waveform, mel→mel (Griffin-Lim), mel→wave vocoders,
+  STFT mask/complex — auto-detected; `.json` sidecar for custom STFT/mel
+  parameters. VRAM-aware model recommender: `main.py cli --recommend-models`.
 - **Extras:** batch queue with drag & drop, per-file progress, before/after
   spectrogram comparison PNGs, GUI *and* CLI, cancelling.
 

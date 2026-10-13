@@ -26,8 +26,12 @@ Language: Python 3.14 (`.venv`). Working dir is the project root.
   (resample, bandwidth estimation/extension, exciter, air, loudness,
   dither, limiter). All operate on `(channels, samples)` float32.
 - `audio_upscaler/engines/` — `dsp_engine.py` (CPU, always available) and
-  `onnx_engine.py` (DirectML: AMD/Intel/NVIDIA + CPU fallback). Registry in
+  `onnx_engine.py` (generic ONNX runner, DirectML/CUDA/CPU). Registry in
   `engines/__init__.py` (`create_engine`, `engine_status`).
+- `audio_upscaler/spectral.py` — numpy/scipy STFT, mel filterbanks,
+  Griffin-Lim, `SpecParams` (sidecar `<model>.json` parsing).
+- `audio_upscaler/recommendations.py` — VRAM-aware curated ONNX model list
+  (CLI `--recommend-models`, GUI button).
 - `audio_upscaler/pipeline.py` — `JobSettings`, file discovery, batch runner
   with progress callbacks and `threading.Event` cancellation.
 - `audio_upscaler/audio_io.py` — soundfile read/write + ffmpeg fallback.
@@ -59,6 +63,14 @@ Language: Python 3.14 (`.venv`). Working dir is the project root.
 - Adding dependencies → update `requirements.txt` **and this file** if the
   workflow changes.
 - Tests must not require a GPU, ffmpeg, network, or a GUI display.
+
+### ONNX engine model kinds
+
+`onnx_engine.OnnxEngine` auto-detects I/O layout from tensor shapes/names:
+`waveform` | `mel2mel` (Griffin-Lim back-end) | `mel2wave` | `stft2stft`
+(mask or 2-channel complex) | `stft2wave` | `generic`. Override/params via
+`<model>.json` sidecar (see `models/README.md`). Every model gets a probe
+inference at construction — failures must produce a clear, actionable error.
 
 ## Notes
 
