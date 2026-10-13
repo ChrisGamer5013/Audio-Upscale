@@ -27,3 +27,7 @@ demo_*.png
 # OS junk
 Thumbs.db
 Desktop.ini
+
+# User's test media (never commit someone else's audio/video!)
+audio/
+video/
