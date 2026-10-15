@@ -92,6 +92,35 @@ def summarize() -> ProviderSummary:
     )
 
 
+def diagnostics() -> str:
+    """Everything useful for a bug report, in one text blob."""
+    import platform
+    import sys
+
+    lines = [f"Python {sys.version.split()[0]} on {platform.platform()}"]
+    for mod in ("numpy", "scipy", "soundfile", "onnxruntime", "customtkinter",
+                "matplotlib", "pyloudnorm"):
+        try:
+            m = __import__(mod)
+            lines.append(f"{mod} {getattr(m, '__version__', '?')}")
+        except ImportError:
+            lines.append(f"{mod} not installed")
+    s = summarize()
+    lines.append("GPUs:")
+    for g in s.gpus:
+        lines.append(f"  - {g.vendor}: {g.name}")
+    lines.append(f"ONNX providers: {', '.join(s.onnx_providers) or 'none'}")
+    lines.append(f"ffmpeg: {_ffmpeg_available()}")
+    try:
+        from .engines import engine_status
+
+        for k, v in engine_status().items():
+            lines.append(f"engine {k}: {v}")
+    except Exception as exc:
+        lines.append(f"engine status failed: {exc}")
+    return "\n".join(lines)
+
+
 def describe(summary: ProviderSummary | None = None) -> str:
     """One-paragraph human-readable hardware summary for UI/CLI."""
     s = summary or summarize()

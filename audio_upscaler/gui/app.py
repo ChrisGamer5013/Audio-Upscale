@@ -34,6 +34,14 @@ _SR_CHOICES = ["44,100", "48,000", "88,200", "96,000", "176,400", "192,000"]
 _LOSSY = {"MP3", "OGG", "OPUS"}
 
 
+def _models_dir() -> Path:
+    from ..bootstrap import app_dir
+
+    d = app_dir() / "models"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
@@ -60,6 +68,77 @@ class App(ctk.CTk):
 
         self._build_ui()
         self._poll_queue()
+        self._load_prefs()
+        self.after(2500, self._check_updates)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ------------------------------------------------------------ prefs
+    _PREF_VARS = (
+        ("engine", "engine_label_var"), ("preset", "preset_var"),
+        ("sr", "sr_var"), ("fmt", "fmt_var"), ("bit", "bit_var"),
+        ("lufs", "lufs_var"), ("denoise", "denoise_var"),
+        ("template", "template_var"), ("workers", "workers_var"),
+        ("outdir", "outdir_var"), ("model", "model_var"),
+        ("device", "device_var"), ("theme", "theme_var"),
+        ("accent", "accent_var"),
+    )
+    _PREF_SWITCHES = (
+        ("loud", "loud_var"), ("dither", "dither_var"), ("spec", "spec_var"),
+        ("auto_preset", "auto_preset_var"), ("declip", "declip_var"),
+        ("mid_side", "ms_var"), ("ultra", "ultra_var"),
+        ("keep_tree", "keeptree_var"), ("nometa", "nometa_var"),
+    )
+
+    def _collect_prefs(self) -> dict:
+        prefs = {}
+        for key, attr in self._PREF_VARS:
+            var = getattr(self, attr, None)
+            if var is not None:
+                prefs[key] = var.get()
+        for key, attr in self._PREF_SWITCHES:
+            var = getattr(self, attr, None)
+            if var is not None:
+                prefs[key] = bool(var.get())
+        prefs["queue"] = [str(p) for p in self._files]
+        return prefs
+
+    def _load_prefs(self) -> None:
+        from .settings_store import load_settings
+
+        prefs = load_settings()
+        for key, attr in self._PREF_VARS:
+            if key in prefs:
+                var = getattr(self, attr, None)
+                if var is not None:
+                    try:
+                        var.set(prefs[key])
+                    except Exception:
+                        pass
+        for key, attr in self._PREF_SWITCHES:
+            if key in prefs:
+                var = getattr(self, attr, None)
+                if var is not None:
+                    try:
+                        var.set(bool(prefs[key]))
+                    except Exception:
+                        pass
+        try:
+            if prefs.get("theme") and prefs["theme"] != "dark":
+                ctk.set_appearance_mode(prefs["theme"])
+        except Exception:
+            pass
+        for q in prefs.get("queue", [])[:200]:
+            p = Path(q)
+            if p.exists():
+                self._files.append(p)
+        if self._files:
+            self._refresh_list()
+
+    def _on_close(self) -> None:
+        from .settings_store import save_settings
+
+        save_settings(self._collect_prefs())
+        self.destroy()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -177,10 +256,20 @@ class App(ctk.CTk):
             gtxt = "  (no GPU detected)"
         ctk.CTkLabel(self.model_frame, text=gtxt, justify="left",
                      text_color="#999", font=ctk.CTkFont(size=11)).pack(anchor="w")
+        pick = ctk.CTkFrame(self.model_frame, fg_color="transparent")
+        pick.pack(fill="x", pady=(6, 0))
+        ctk.CTkLabel(pick, text="Models in models\\:").pack(anchor="w")
+        self.model_pick = ctk.CTkOptionMenu(
+            pick, values=["(refresh)"], command=self._on_model_pick)
+        self.model_pick.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(pick, text="Refresh", width=62,
+                      command=self._refresh_model_list).pack(side="left", padx=(4, 0))
         ctk.CTkButton(
             self.model_frame, text="Model recommendations (VRAM-aware)",
             command=self._show_recommendations,
         ).pack(anchor="w", pady=(6, 0))
+        self._model_pick_map: dict[str, str] = {}
+        self.after(300, self._refresh_model_list)
 
         # preset
         label("Preset (DSP engine)")
@@ -233,6 +322,20 @@ class App(ctk.CTk):
         row_widget(ctk.CTkSwitch(right, text="Save before/after spectrograms",
                                  variable=self.spec_var))
 
+        # ---- tabs: Enhance / Batch / About ----
+        tabs = ctk.CTkTabview(right, height=250)
+        row_widget(tabs)
+        tab_enh = tabs.add("Enhance")
+        tab_batch = tabs.add("Batch")
+        tab_about = tabs.add("About")
+        for t in (tab_enh, tab_batch, tab_about):
+            t.grid_columnconfigure(0, weight=1)
+
+        # Enhance / Batch / About tabs (methods below)
+        self._build_enhance_tab(tab_enh)
+        self._build_batch_tab(tab_batch)
+        self._build_about_tab(tab_about)
+
         # ---------------- bottom: output + actions ----------------
         bottom = ctk.CTkFrame(main)
         bottom.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -276,6 +379,102 @@ class App(ctk.CTk):
         self._on_fmt_change(None)
 
     # ------------------------------------------------------------------ helpers
+    def _build_enhance_tab(self, tab) -> None:
+        self.auto_preset_var = tk.BooleanVar(value=False)
+        ctk.CTkSwitch(tab, text="Auto preset per file",
+                      variable=self.auto_preset_var).grid(
+            row=0, column=0, padx=8, pady=3, sticky="w")
+        dn = ctk.CTkFrame(tab, fg_color="transparent")
+        dn.grid(row=1, column=0, padx=8, pady=3, sticky="ew")
+        ctk.CTkLabel(dn, text="Denoise (0=off, 1 mild, 2 strong):").pack(side="left")
+        self.denoise_var = tk.StringVar(value="0")
+        ctk.CTkEntry(dn, textvariable=self.denoise_var, width=46).pack(side="left", padx=6)
+        self.declip_var = tk.BooleanVar(value=False)
+        ctk.CTkSwitch(tab, text="Declip (repair clipped audio)",
+                      variable=self.declip_var).grid(
+            row=2, column=0, padx=8, pady=3, sticky="w")
+        self.ms_var = tk.BooleanVar(value=False)
+        ctk.CTkSwitch(tab, text="Mid/Side mode (stereo)",
+                      variable=self.ms_var).grid(
+            row=3, column=0, padx=8, pady=3, sticky="w")
+        self.ultra_var = tk.BooleanVar(value=False)
+        ctk.CTkSwitch(tab, text="Ultra resampler (slower)",
+                      variable=self.ultra_var).grid(
+            row=4, column=0, padx=8, pady=3, sticky="w")
+
+    def _build_batch_tab(self, tab) -> None:
+        wr = ctk.CTkFrame(tab, fg_color="transparent")
+        wr.grid(row=0, column=0, padx=8, pady=3, sticky="ew")
+        ctk.CTkLabel(wr, text="Parallel workers (1-8):").pack(side="left")
+        self.workers_var = tk.StringVar(value="1")
+        ctk.CTkEntry(wr, textvariable=self.workers_var, width=42).pack(side="left", padx=6)
+
+        ctk.CTkLabel(tab, text="Name template:  {name} {suffix} {sr} {preset} "
+                     "{format} {date} {time}", wraplength=280, justify="left",
+                     text_color="#999", font=ctk.CTkFont(size=10)).grid(
+            row=1, column=0, padx=8, sticky="w")
+        self.template_var = tk.StringVar(value="{name}{suffix}")
+        ctk.CTkEntry(tab, textvariable=self.template_var).grid(
+            row=2, column=0, padx=8, pady=2, sticky="ew")
+        self.keeptree_var = tk.BooleanVar(value=False)
+        ctk.CTkSwitch(tab, text="Keep folder structure (keep-tree)",
+                      variable=self.keeptree_var).grid(
+            row=3, column=0, padx=8, pady=3, sticky="w")
+        self.nometa_var = tk.BooleanVar(value=False)
+        ctk.CTkSwitch(tab, text="Skip metadata copy",
+                      variable=self.nometa_var).grid(
+            row=4, column=0, padx=8, pady=3, sticky="w")
+
+        rowb = ctk.CTkFrame(tab, fg_color="transparent")
+        rowb.grid(row=5, column=0, padx=8, pady=4, sticky="ew")
+        ctk.CTkButton(rowb, text="Estimate", width=80,
+                      command=self._show_estimate).pack(side="left")
+        ctk.CTkButton(rowb, text="Compare presets", width=110,
+                      command=self._compare_presets).pack(side="left", padx=6)
+
+        wl = ctk.CTkFrame(tab, fg_color="transparent")
+        wl.grid(row=6, column=0, padx=8, pady=4, sticky="ew")
+        self.watch_var = tk.BooleanVar(value=False)
+        ctk.CTkSwitch(wl, text="Watch folder", variable=self.watch_var,
+                      command=self._toggle_watch).pack(side="left")
+        ctk.CTkButton(wl, text="Pick…", width=52,
+                      command=self._pick_watch_dir).pack(side="left", padx=6)
+        self.watch_dir: Path | None = None
+        self._watch_seen: set[str] = set()
+        self._watch_job: str | None = None
+
+    def _build_about_tab(self, tab) -> None:
+        ctk.CTkButton(tab, text="Diagnostics (copy for bug reports)",
+                      command=self._show_diagnostics).grid(
+            row=0, column=0, padx=8, pady=4, sticky="ew")
+        ctk.CTkButton(tab, text="Check for updates",
+                      command=self._check_updates).grid(
+            row=1, column=0, padx=8, pady=4, sticky="ew")
+        self.update_lbl = ctk.CTkLabel(tab, text="", text_color="#8fd18b",
+                                       font=ctk.CTkFont(size=11))
+        self.update_lbl.grid(row=2, column=0, padx=8, sticky="w")
+        ctk.CTkButton(tab, text="Download starter model",
+                      command=self._download_starter).grid(
+            row=3, column=0, padx=8, pady=4, sticky="ew")
+        ctk.CTkButton(tab, text="GPU backend requirements",
+                      command=self._show_requirements).grid(
+            row=4, column=0, padx=8, pady=4, sticky="ew")
+        th = ctk.CTkFrame(tab, fg_color="transparent")
+        th.grid(row=5, column=0, padx=8, pady=4, sticky="ew")
+        ctk.CTkLabel(th, text="Theme:").pack(side="left")
+        self.theme_var = tk.StringVar(value="dark")
+        ctk.CTkOptionMenu(th, variable=self.theme_var,
+                          values=["dark", "light", "system"],
+                          command=lambda v: ctk.set_appearance_mode(v)
+                          ).pack(side="left", padx=4)
+        self.accent_var = tk.StringVar(value="blue")
+        ctk.CTkOptionMenu(th, variable=self.accent_var,
+                          values=["blue", "green", "dark-blue"]
+                          ).pack(side="left", padx=4)
+        ctk.CTkLabel(tab, text="Accent applies after restart.",
+                     text_color="#888", font=ctk.CTkFont(size=10)).grid(
+            row=6, column=0, padx=8, sticky="w")
+
     def _on_engine_change(self, label_text: str) -> None:
         if label_text == MODEL_LABELS["onnx"]:
             self.model_frame.grid(row=3, column=0, padx=10, pady=2, sticky="ew")
@@ -304,9 +503,27 @@ class App(ctk.CTk):
         data = event.data
         paths = re.findall(r"\{([^}]*)\}|(\S+)", data)
         for brace, bare in paths:
-            p = brace or bare
-            if p:
-                self._add_paths([Path(p)])
+            p = Path(brace or bare)
+            if not p.name:
+                continue
+            if p.suffix.lower() == ".onnx" and p.is_file():
+                # model dropped: copy into models/ and select it
+                import shutil as _sh
+
+                dest = _models_dir() / p.name
+                try:
+                    if p.resolve() != dest.resolve():
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        _sh.copy2(p, dest)
+                except Exception as exc:
+                    messagebox.showerror("Model import failed", str(exc))
+                    continue
+                self.engine_label_var.set(MODEL_LABELS["onnx"])
+                self._on_engine_change(MODEL_LABELS["onnx"])
+                self.model_var.set(str(dest))
+                self._refresh_model_list()
+            else:
+                self._add_paths([p])
 
     def _add_paths(self, paths: list[Path]) -> None:
         added = 0
@@ -358,6 +575,28 @@ class App(ctk.CTk):
         self._files.clear()
         self.file_listbox.delete(0, "end")
 
+    def _refresh_model_list(self) -> None:
+        def work():
+            from ..engines.onnx_engine import OnnxEngine
+
+            items, mapping = [], {}
+            for p in sorted(_models_dir().glob("*.onnx")):
+                try:
+                    kind = OnnxEngine.inspect(p)
+                except Exception:
+                    kind = "?"
+                label = f"{p.name}  [{kind}]"
+                items.append(label)
+                mapping[label] = str(p)
+            self._msg_q.put(("models", items or ["(none found)"], mapping))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_model_pick(self, label: str) -> None:
+        path = getattr(self, "_model_pick_map", {}).get(label)
+        if path:
+            self.model_var.set(path)
+
     def _browse_model(self) -> None:
         p = filedialog.askopenfilename(
             title="Select ONNX model", filetypes=[("ONNX model", "*.onnx")])
@@ -391,6 +630,18 @@ class App(ctk.CTk):
         bit_raw = self.bit_var.get()
         bit = 32 if "32" in bit_raw else (16 if "16" in bit_raw else 24)
 
+        def _float(var, default=0.0):
+            try:
+                return float(var.get())
+            except (ValueError, AttributeError):
+                return default
+
+        def _int(var, default=1):
+            try:
+                return int(var.get())
+            except (ValueError, AttributeError):
+                return default
+
         return JobSettings(
             target_sr=sr,
             fmt=self._fmt_key(),
@@ -405,7 +656,164 @@ class App(ctk.CTk):
             out_dir=out_path,
             suffix="_upscaled",
             save_spectrograms=self.spec_var.get(),
+            denoise=_float(self.denoise_var, 0.0),
+            declip=self.declip_var.get(),
+            mid_side=self.ms_var.get(),
+            ultra_resample=self.ultra_var.get(),
+            auto_preset=self.auto_preset_var.get(),
+            name_template=self.template_var.get() or "{name}{suffix}",
+            keep_tree=self.keeptree_var.get(),
+            workers=max(1, min(8, _int(self.workers_var, 1))),
+            copy_metadata=not self.nometa_var.get(),
         )
+
+    # ------------------------------------------------- About-tab actions
+    def _show_diagnostics(self) -> None:
+        from .dialogs import text_dialog_async
+        from ..providers import diagnostics
+
+        text_dialog_async(self, "Diagnostics", diagnostics,
+                          loading_text="Probing hardware, runtimes…")
+
+    def _show_requirements(self) -> None:
+        from .dialogs import text_dialog
+        from ..recommendations import requirements_text
+
+        text_dialog(self, "GPU backend requirements", requirements_text())
+
+    def _check_updates(self) -> None:
+        def work():
+            from ..updater import check_for_update
+
+            cur, latest, tag = check_for_update()
+            self._msg_q.put(("update", cur, latest))
+
+        self.update_lbl.configure(text="checking…", text_color="#999")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _download_starter(self) -> None:
+        def work():
+            from ..updater import ensure_starter_model
+
+            p = ensure_starter_model(log=lambda s: None)
+            self._msg_q.put(("starter", str(p) if p else ""))
+
+        self.update_lbl.configure(text="downloading starter model…",
+                                  text_color="#999")
+        threading.Thread(target=work, daemon=True).start()
+
+    # ------------------------------------------------ Estimate / Compare
+    def _show_estimate(self) -> None:
+        from .dialogs import text_dialog_async
+        from ..pipeline import collect_audio_files
+
+        files = collect_audio_files(self._files)
+        if not files:
+            messagebox.showinfo("Estimate", "Queue is empty.")
+            return
+
+        def load():
+            from ..audio_io import read_audio
+            from ..dsp import estimate_bandwidth
+
+            out = [f"{'file':<40} {'in sr':>8} {'dur':>8} {'ch':>3} {'bandwidth':>10}"]
+            for f in files:
+                try:
+                    x, sr = read_audio(f)
+                    bw = estimate_bandwidth(x, sr)
+                    out.append(
+                        f"{f.name[:40]:<40} {sr:>8} {x.shape[-1] / sr:>6.1f}s "
+                        f"{x.shape[0]:>3} {bw / 1000:>8.1f}k")
+                except Exception as exc:
+                    out.append(f"{f.name[:40]:<40} ERROR: {exc}")
+            return "\n".join(out)
+
+        text_dialog_async(self, "Estimate", load)
+
+    def _compare_presets(self) -> None:
+        sel = self.file_listbox.curselection()
+        if sel:
+            src = self._files[sel[0]]
+        elif self._files:
+            src = self._files[0]
+        else:
+            messagebox.showinfo("Compare", "Add a file first.")
+            return
+        if src.is_dir():
+            messagebox.showinfo("Compare", "Select a file (not a folder).")
+            return
+        settings = self._gather_settings()
+        if settings is None:
+            return
+        threading.Thread(target=self._compare_worker,
+                         args=(src, settings), daemon=True).start()
+        self.progress_lbl.configure(text="Comparing presets…")
+
+    def _compare_worker(self, src: Path, settings: JobSettings) -> None:
+        try:
+            from ..pipeline import process_file
+            from ..presets import PRESETS
+
+            engine = create_engine(settings.engine_id, settings.model_path,
+                                   settings.device_id)
+            reports = []
+            total = len(PRESETS)
+            for i, key in enumerate(PRESETS):
+                s = JobSettings(**{**settings.__dict__, "preset": key,
+                                   "suffix": f"_{key}",
+                                   "save_spectrograms": False,
+                                   "out_dir": settings.out_dir or src.parent})
+                reports.append(process_file(src, s, engine, None, i, total))
+                self._msg_q.put(("progress", i, total, 1.0,
+                                 f"compare:{key}"))
+            ok = sum(1 for r in reports if r.ok)
+            self._msg_q.put(("info", f"{ok}/{total} preset variants written "
+                                     f"next to the file."))
+        except Exception as exc:
+            self._msg_q.put(("error", str(exc)))
+
+    # --------------------------------------------------------------- watch
+    def _toggle_watch(self) -> None:
+        if self.watch_var.get():
+            if not self.watch_dir:
+                self._pick_watch_dir()
+            if not self.watch_dir:
+                self.watch_var.set(False)
+                return
+            self._watch_seen = {str(f).lower() for f in self._all_audio(self.watch_dir)}
+            self._watch_job = self.after(3000, self._watch_tick)
+            self.progress_lbl.configure(text=f"Watching {self.watch_dir}")
+        else:
+            if self._watch_job:
+                self.after_cancel(self._watch_job)
+                self._watch_job = None
+            self.progress_lbl.configure(text="Watch stopped")
+
+    def _pick_watch_dir(self) -> None:
+        d = filedialog.askdirectory(title="Pick watch folder")
+        if d:
+            self.watch_dir = Path(d)
+
+    @staticmethod
+    def _all_audio(folder: Path):
+        from ..audio_io import INPUT_EXTENSIONS
+
+        return [p for p in folder.rglob("*") if p.is_file()
+                and p.suffix.lower() in INPUT_EXTENSIONS]
+
+    def _watch_tick(self) -> None:
+        if not self.watch_var.get() or not self.watch_dir:
+            return
+        try:
+            for p in self._all_audio(self.watch_dir):
+                key = str(p).lower()
+                if key not in self._watch_seen:
+                    self._watch_seen.add(key)
+                    self._files.append(p)
+                    self._refresh_list()
+        except Exception:
+            pass
+        self._watch_job = self.after(3000, self._watch_tick)
 
     # ------------------------------------------------------------------ actions
     def _start_batch(self) -> None:
@@ -423,6 +831,10 @@ class App(ctk.CTk):
             settings.out_dir = self._files[0].parent if self._files[0].is_file() else self._files[0]
         self._out_dir = settings.out_dir
 
+        from .settings_store import save_settings
+
+        save_settings(self._collect_prefs())
+
         self._cancel.clear()
         self.start_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
@@ -434,8 +846,9 @@ class App(ctk.CTk):
         self._worker.start()
 
     def _worker_run(self, files: list[Path], settings: JobSettings) -> None:
-        from ..pipeline import collect_audio_files
-        flat = collect_audio_files(files)
+        from ..pipeline import collect_audio_with_roots
+
+        flat, roots = collect_audio_with_roots(files)
         if not flat:
             self._msg_q.put(("error", "No supported audio files found."))
             return
@@ -444,7 +857,8 @@ class App(ctk.CTk):
             self._msg_q.put(("progress", i, total, frac, msg))
 
         try:
-            summary = run_batch(flat, settings, progress=cb, cancel=self._cancel)
+            summary = run_batch(flat, settings, progress=cb,
+                                cancel=self._cancel, roots=roots)
             self._msg_q.put(("done", summary))
         except Exception as exc:
             self._msg_q.put(("error", str(exc)))
@@ -498,6 +912,29 @@ class App(ctk.CTk):
                         self._reco_box.configure(state="disabled")
                     except Exception:
                         pass
+                elif kind == "update":
+                    _, cur, latest = msg
+                    if latest:
+                        self.update_lbl.configure(
+                            text=f"Update available: v{latest} (you have {cur})",
+                            text_color="#e6c07b")
+                    else:
+                        self.update_lbl.configure(text=f"Up to date (v{cur})",
+                                                  text_color="#8fd18b")
+                elif kind == "starter":
+                    if msg[1]:
+                        self.update_lbl.configure(text=f"Model: {Path(msg[1]).name}",
+                                                  text_color="#8fd18b")
+                        self._refresh_model_list()
+                    else:
+                        self.update_lbl.configure(text="starter download failed",
+                                                  text_color="#e07b7b")
+                elif kind == "info":
+                    messagebox.showinfo("Info", msg[1])
+                elif kind == "models":
+                    _, items, mapping = msg
+                    self._model_pick_map = mapping
+                    self.model_pick.configure(values=items)
         except queue.Empty:
             pass
         self.after(80, self._poll_queue)

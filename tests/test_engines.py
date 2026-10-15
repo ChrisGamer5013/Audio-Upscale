@@ -172,6 +172,82 @@ def test_provider_summary():
     assert isinstance(s.gpus, list)
 
 
+# ---------------------------------------------------------------- v0.2
+def test_declip_restores_headroom():
+    sr = 44_100
+    t = np.arange(sr, dtype=np.float64) / sr
+    x = (np.sin(2 * np.pi * 440 * t) * 1.5).astype(np.float32)  # hard clip
+    assert (np.abs(x) >= 0.999).mean() > 0.2
+    y = dsp.declip(x[None, :], sr)
+    assert (np.abs(y) >= 0.999).mean() < 0.01
+    assert np.isfinite(y).all()
+
+
+def test_spectral_gate_reduces_noise_during_silence():
+    sr = 22_050
+    rng = np.random.default_rng(3)
+    noise = (rng.standard_normal(sr) * 0.02).astype(np.float32)
+    x = noise.copy()
+    x[sr // 2:] += _sweep(sr, 0.5)[: sr - sr // 2] * 0.5  # noise then signal
+    y = dsp.spectral_gate(x[None, :], sr, strength=2.0)[0]
+    q0 = float(np.sqrt(np.mean(x[: sr // 4] ** 2)))
+    q1 = float(np.sqrt(np.mean(y[: sr // 4] ** 2)))
+    assert q1 < q0 * 0.7  # noise floor pushed down
+    s0 = float(np.sqrt(np.mean(x[-sr // 4:] ** 2)))
+    s1 = float(np.sqrt(np.mean(y[-sr // 4:] ** 2)))
+    assert s1 > s0 * 0.5  # signal mostly preserved
+
+
+def test_mid_side_roundtrip():
+    x = np.random.default_rng(1).standard_normal((2, 1000)).astype(np.float32)
+    ms = dsp.to_mid_side(x)
+    back = dsp.from_mid_side(ms)
+    assert np.allclose(x, back, atol=1e-6)
+
+
+def test_name_template_and_keep_tree(tmp_path):
+    from audio_upscaler.pipeline import collect_audio_with_roots
+
+    src_root = tmp_path / "in"
+    sub = src_root / "album"
+    sub.mkdir(parents=True)
+    x = _sweep(22_050, 0.2)
+    src = sub / "track.wav"
+    write_audio(src, x, 22_050, fmt="WAV", bit_depth=16)
+
+    files, roots = collect_audio_with_roots([src_root])
+    assert files == [src] and roots[src] == src_root
+
+    settings = JobSettings(
+        target_sr=48_000, fmt="WAV", out_dir=tmp_path / "out",
+        keep_tree=True, name_template="{name}_{sr}_{preset}",
+        preset="voice", save_spectrograms=False,
+    )
+    summary = run_batch(files, settings, roots=roots)
+    assert summary.succeeded == 1
+    out = summary.reports[0].output
+    assert out.name == "track_48000_voice.wav"
+    assert out.parent == tmp_path / "out" / "album"
+
+
+def test_user_presets_roundtrip():
+    from audio_upscaler.presets import Preset, all_presets, save_user_preset
+
+    key = "test_custom_zz"
+    save_user_preset(Preset(key=key, label="T", description="d", amount=0.5,
+                            exciter=0.1, exciter_drive=2.0, air=0.01,
+                            hf_cap_hz=16_000, slope_db_per_oct=10.0))
+    assert key in all_presets()
+
+
+def test_keep_tree_and_requirements_text_exist():
+    from audio_upscaler.recommendations import requirements_text
+
+    txt = requirements_text()
+    for word in ("DirectML", "CUDA", "ROCm", "XPU"):
+        assert word in txt
+
+
 if __name__ == "__main__":
     import time
 

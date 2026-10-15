@@ -31,7 +31,16 @@ Language: Python 3.14 (`.venv`). Working dir is the project root.
 - `audio_upscaler/spectral.py` — numpy/scipy STFT, mel filterbanks,
   Griffin-Lim, `SpecParams` (sidecar `<model>.json` parsing).
 - `audio_upscaler/recommendations.py` — VRAM-aware curated ONNX model list
-  (CLI `--recommend-models`, GUI button).
+  (CLI `--recommend-models`, GUI button) + `requirements_text()` with
+  per-GPU system requirements (shown in GUI About tab and README).
+- `audio_upscaler/updater.py` — GitHub release check + starter-model
+  download (`starter_bwe_48k.onnx` from latest release assets).
+- `audio_upscaler/gui/{dialogs,settings_store}.py` — reusable text dialogs;
+  GUI prefs/queue persistence in `%APPDATA%/AudioUpscalerHD/settings.json`.
+- `scripts/train_starter.py` — synthetic-data training of the bundled model;
+  `scripts/install_context_menu.py` — Explorer integration (HKCU only).
+- `.github/workflows/` — ci.yml (tests, win+linux) and release.yml
+  (on `v*` tag: tests → PyInstaller → attach exes to the release).
 - `audio_upscaler/pipeline.py` — `JobSettings`, file discovery, batch runner
   with progress callbacks and `threading.Event` cancellation.
 - `audio_upscaler/audio_io.py` — soundfile read/write + ffmpeg fallback.
@@ -49,6 +58,11 @@ Language: Python 3.14 (`.venv`). Working dir is the project root.
 - `models/` — user-supplied `.onnx` models (see `models/README.md`).
 
 ## Conventions
+
+- GUI must expose every CLI feature (user requirement): new flags get a GUI
+  control in the same change; add prefs to `_PREF_VARS`/`_PREF_SWITCHES`.
+- Keep GUI edits small and verify with
+  `python -c "from audio_upscaler.gui.app import App; a=App(); a.update(); a.destroy()"`.
 
 - Audio arrays are always `(channels, samples)` float32 internally;
   `dsp.ensure_channels` normalizes.

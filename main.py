@@ -29,6 +29,9 @@ def main() -> int:
             if not ffmpeg_available():
                 print("First run: downloading ffmpeg (one-time) ...")
                 ensure_ffmpeg()
+            from audio_upscaler.updater import ensure_starter_model
+
+            ensure_starter_model()
         except Exception as exc:  # never block startup
             print(f"bootstrap warning: {exc}")
 

@@ -177,6 +177,14 @@ def train(data_folder: Path, out_model: Path, sr: int = 48_000,
           steps_per_epoch: int = 400, lr: float = 2e-4,
           device: str | None = None,
           log=print) -> Path:
+    import sys
+
+    for stream in (sys.stdout, sys.stderr):  # torch.onnx logs emoji
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     torch, nn = _require_torch()
 
     dev = detect_device(torch, device or "auto", log)

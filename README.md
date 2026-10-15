@@ -18,8 +18,14 @@ High-quality audio super-resolution / bandwidth extension for Windows.
 - **Generic ONNX runner:** waveform, mel→mel (Griffin-Lim), mel→wave vocoders,
   STFT mask/complex — auto-detected; `.json` sidecar for custom STFT/mel
   parameters. VRAM-aware model recommender: `main.py cli --recommend-models`.
-- **Extras:** batch queue with drag & drop, per-file progress, before/after
-  spectrogram comparison PNGs, GUI *and* CLI, cancelling.
+- **Extras:** batch queue with drag & drop (incl. dropping `.onnx` models),
+  per-file progress, before/after spectrogram PNGs, GUI *and* CLI, cancelling.
+- **v0.2 extras:** declipper, spectral-gate denoiser, mid/side mode,
+  auto-preset per file, watch-folder mode, parallel batch workers, output
+  name templates, folder-structure mirroring, metadata copy, LUFS + true-peak
+  report per file, ultra resampler, update checker, settings persistence,
+  dark/light themes, diagnostics panel, Explorer right-click integration,
+  GitHub CI that auto-builds releases, bundled starter BWE model.
 
 ---
 
@@ -40,7 +46,14 @@ into `tools\ffmpeg`).
 .venv\Scripts\python main.py cli --help
 .venv\Scripts\python main.py cli *.wav --sr 48000 --preset music
 .venv\Scripts\python main.py cli input.mp3 --engine onnx --model models\mysr.onnx --device 0
-.venv\Scripts\python main.py cli --gpu-info
+.venv\Scripts\python main.py cli --gpu-info | --doctor | --recommend-models
+.venv\Scripts\python main.py cli --check-update | --get-starter-model
+REM v0.2 flags (all also available in the GUI):
+.venv\Scripts\python main.py cli album\ --denoise 1.5 --declip --mid-side --workers 4 --keep-tree
+.venv\Scripts\python main.py cli song.flac --compare music,voice,restore
+.venv\Scripts\python main.py cli inbox\ --watch 10 -o out\ --auto-preset
+.venv\Scripts\python main.py cli music\ --estimate
+.venv\Scripts\python main.py cli track.wav --name-template "{name}_{sr}k_{preset}"
 ```
 
 ### Try it instantly
@@ -64,6 +77,25 @@ yourself:
 REM -> dist\AudioUpscalerHD-standalone.exe  (single-file, all-in-one)
 REM -> dist\AudioUpscalerHD-portable.zip    (portable folder)
 ```
+
+## System requirements per GPU backend
+
+**Inference (upscaling) — all vendors, zero setup:** DirectML runs on any
+DX12-capable GPU: AMD, Intel and NVIDIA all work with just a normal graphics
+driver. ONNX models of most layouts work (waveform, mel, STFT, vocoders).
+
+**Training (`main.py train`) — pick one:**
+
+| GPU | What you need installed | Project dependency |
+|---|---|---|
+| NVIDIA | Any R525+ driver. The pip wheel bundles the CUDA runtime — no CUDA toolkit needed | `pip install -r requirements-train-nvidia.txt` (cu128 index) |
+| AMD | RDNA2-4 (RX 6000/7000/9000). ROCm-certified Adrenalin driver 25.x+; HIP SDK 7.x (or use the self-contained wheels — no SDK needed) | `pip install -r requirements-train-amd.txt` (stable.repo.amd.com/rocm) |
+| Intel | Arc A/B-series or Core Ultra iGPU. Driver 32.0.101.8801+ (Win 11). Level Zero ships in the wheels — no oneAPI install needed | `pip install -r requirements-train-intel.txt` (download.pytorch.org/whl/xpu) |
+| none | — | `pip install -r requirements-train.txt` (CPU) |
+
+Verify GPU training: `python -c "import torch; print(torch.cuda.is_available())"`
+(AMD ROCm also answers via `torch.cuda`), Intel: `torch.xpu.is_available()`.
+In the GUI: **About → GPU backend requirements** shows this in-app.
 
 ## Train your own ONNX model
 
@@ -126,3 +158,13 @@ built-in N× resampling. Long files are processed in overlapping chunks.
   `.venv\Scripts\python scripts\install_ffmpeg.py` or install ffmpeg manually.
 - **GUI won't start** — use the CLI (`main.py cli ...`); GUI needs
   `customtkinter`, `Pillow` and optionally `tkinterdnd2`.
+
+## Explorer integration (optional)
+
+```bat
+.venv\Scripts\python scripts\install_context_menu.py          REM install
+.venv\Scripts\python scripts\install_context_menu.py remove   REM uninstall
+```
+
+Adds right-click "Upscale with Audio Upscaler HD" for common audio types +
+a Send-to entry (per-user registry, no admin).

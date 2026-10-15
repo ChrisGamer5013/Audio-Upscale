@@ -123,6 +123,46 @@ def fits(rec: ModelRec, vram_gb: float) -> bool:
     return rec.min_vram_gb <= vram_gb
 
 
+def requirements_text() -> str:
+    """Per-GPU system requirements, shown in GUI and README."""
+    return """\
+INFERENCE (running the upscaler) — works on all three vendors today:
+  Uses ONNX Runtime DirectML. No toolkit needed beyond a normal graphics
+  driver (DX12). AMD / Intel / NVIDIA all supported out of the box.
+
+TRAINING (main.py train) — pick your vendor:
+
+NVIDIA (CUDA):
+  - Driver: any recent GeForce/Quadro driver (R525+)
+  - Project dep:  pip install -r requirements-train-nvidia.txt
+    (installs torch from the cu128 index; CUDA toolkit NOT required —
+     the wheel bundles the runtime)
+
+AMD (ROCm on Windows):
+  - GPU: RDNA2/RDNA3/RDNA4 (RX 6000/7000/9000 series); iGPUs vary
+  - Driver: AMD Software: Adrenalin Edition 25.x or newer (ROCm-certified)
+  - Runtime: HIP SDK 7.x installed (AMD's "ROCm Components for Windows"),
+    OR use the self-contained wheels below
+  - Project dep:  pip install -r requirements-train-amd.txt
+    (wheel index: stable.repo.amd.com/rocm — matches your Python;
+     ROCm 10.x wheels support Python 3.10-3.14)
+  - Verify:  python -c "import torch; print(torch.cuda.is_available())"
+
+INTEL (XPU):
+  - GPU: Arc A/B-series, or Core Ultra integrated Arc (Xe/Arc only)
+  - Driver: Intel Graphics Driver 32.0.101.8801+ (Windows 11); the Level
+    Zero runtime ships inside the PyTorch XPU wheels — no oneAPI install
+    needed for pip usage
+  - Project dep:  pip install -r requirements-train-intel.txt
+    (wheel index: download.pytorch.org/whl/xpu)
+  - Verify:  python -c "import torch; print(torch.xpu.is_available())"
+
+FALLBACKS:
+  - torch-directml (optional): the legacy cross-vendor training backend,
+    mixed pip torch versions — only use if ROCm/XPU unavailable
+  - plain CPU: always works, slowest (requirements-train.txt)"""
+
+
 def recommendation_report() -> str:
     gpus = gpu_vram_map()
     vram = total_vram_gb()

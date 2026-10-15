@@ -29,10 +29,17 @@ def run(cmd: list[str], **kw) -> None:
     subprocess.run(cmd, cwd=ROOT, check=True, **kw)
 
 
+def _python() -> Path:
+    """venv python locally, system python on CI."""
+    if VENV_PY.is_file():
+        return VENV_PY
+    return Path(sys.executable)
+
+
 def pyinstaller_build() -> Path:
-    if not (VENV_PY).is_file():
-        sys.exit("venv missing - run setup_env.bat first")
-    run([str(VENV_PY), "-m", "pip", "install", "-q", "-r",
+    if not _python().is_file():
+        sys.exit("no usable python - run setup_env.bat first")
+    run([str(_python()), "-m", "pip", "install", "-q", "-r",
          "requirements-build.txt"])
     base = [
         "--noconfirm", "--clean",
@@ -44,10 +51,10 @@ def pyinstaller_build() -> Path:
         "--exclude-module", "pytest",
     ]
     # portable folder build (fast startup, installer source)
-    run([str(VENV_PY), "-m", "PyInstaller", *base,
+    run([str(_python()), "-m", "PyInstaller", *base,
          "--name", APP_NAME, "main.py"])
     # single-file all-in-one exe (everything embedded; self-extracts on run)
-    run([str(VENV_PY), "-m", "PyInstaller", *base,
+    run([str(_python()), "-m", "PyInstaller", *base,
          "--onefile", "--name", f"{APP_NAME}-standalone", "main.py"])
     onefile = ROOT / "dist" / f"{APP_NAME}-standalone.exe"
     if not onefile.is_file():
@@ -55,9 +62,11 @@ def pyinstaller_build() -> Path:
     app_dir = ROOT / "dist" / APP_NAME
     if not (app_dir / f"{APP_NAME}.exe").is_file():
         sys.exit("PyInstaller build failed - exe not found")
-    # bundle models/README so users see where to drop .onnx files
+    # bundle models/README + any local .onnx models (e.g. starter BWE)
     (app_dir / "models").mkdir(exist_ok=True)
     shutil.copy2(ROOT / "models" / "README.md", app_dir / "models" / "README.md")
+    for model in (ROOT / "models").glob("*.onnx"):
+        shutil.copy2(model, app_dir / "models" / model.name)
     return app_dir
 
 

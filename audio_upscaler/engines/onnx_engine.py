@@ -62,6 +62,38 @@ def _static_dims(shape) -> list[int]:
     return [d for d in shape if isinstance(d, int)]
 
 
+def _spectral_hint(name: str, dims: list[int]) -> bool:
+    return any(h in name for h in _SPECTRAL_NAME_HINTS) or bool(
+        _MEL_DIMS.intersection(dims) or _STFT_DIMS.intersection(dims)
+    )
+
+
+def _bin_kind(shape) -> str:
+    dims = _static_dims(shape)[1:]
+    if _MEL_DIMS.intersection(dims):
+        return "mel"
+    return "stft"
+
+
+def _classify_io(inp, out) -> str:
+    ishape = list(inp.shape or [])
+    oshape = list(out.shape or [])
+    iname = inp.name.lower()
+    oname = out.name.lower()
+    rank_o = len(oshape)
+
+    i_spec = _spectral_hint(iname, _static_dims(ishape)[1:])
+    o_spec = _spectral_hint(oname, _static_dims(oshape)[1:])
+    o_wave = rank_o in (2, 3) and not o_spec
+    if i_spec and o_wave:
+        return "mel2wave" if _bin_kind(ishape) == "mel" else "stft2wave"
+    if i_spec and o_spec:
+        return "mel2mel" if _bin_kind(ishape) == "mel" else "stft2stft"
+    if not i_spec and not o_wave:
+        return "generic"
+    return "waveform"
+
+
 class OnnxEngine:
     name = "onnx"
 
@@ -81,9 +113,16 @@ class OnnxEngine:
 
         opts = self.ort.SessionOptions()
         opts.log_severity_level = 3
-        self.session = self.ort.InferenceSession(
-            str(self.model_path), sess_options=opts, providers=providers
-        )
+        try:
+            self.session = self.ort.InferenceSession(
+                str(self.model_path), sess_options=opts, providers=providers
+            )
+        except Exception:
+            # GPU provider present but broken (driver etc.) -> bare CPU
+            self.session = self.ort.InferenceSession(
+                str(self.model_path), sess_options=opts,
+                providers=["CPUExecutionProvider"],
+            )
         self.ins = self.session.get_inputs()
         self.outs = self.session.get_outputs()
 
@@ -102,31 +141,23 @@ class OnnxEngine:
         self._spec_params: SpecParams | None = None
         self._probe()
 
+    @classmethod
+    def inspect(cls, model_path: str | Path) -> str:
+        """Cheap kind classification without a probe run (for model lists)."""
+        ort = _import_ort()
+        sopts = ort.SessionOptions()
+        sopts.log_severity_level = 3
+        sess = ort.InferenceSession(str(model_path), sess_options=sopts,
+                                    providers=["CPUExecutionProvider"])
+        ins, outs = sess.get_inputs(), sess.get_outputs()
+        del sess
+        return _classify_io(ins[0], outs[0])
+
     # ---------------------------------------------------------- classify
     def _classify(self) -> str:
-        ishape = list(self.ins[0].shape or [])
-        oshape = list(self.outs[0].shape or [])
-        iname = self.ins[0].name.lower()
-        oname = self.outs[0].name.lower()
-        rank_i, rank_o = len(ishape), len(oshape)
+        return _classify_io(self.ins[0], self.outs[0])
 
-        def spectral_hint(name, dims):
-            return any(h in name for h in _SPECTRAL_NAME_HINTS) or bool(
-                _MEL_DIMS.intersection(dims) or _STFT_DIMS.intersection(dims)
-            )
 
-        i_spec = spectral_hint(iname, _static_dims(ishape)[1:])
-        o_spec = spectral_hint(oname, _static_dims(oshape)[1:])
-
-        # output waveform?
-        o_wave = rank_o in (2, 3) and not o_spec
-        if i_spec and o_wave:
-            return "mel2wave" if self._bin_kind(ishape) == "mel" else "stft2wave"
-        if i_spec and o_spec:
-            return "mel2mel" if self._bin_kind(ishape) == "mel" else "stft2stft"
-        if not i_spec and not o_wave:
-            return "generic"  # best effort last resort
-        return "waveform"
 
     @staticmethod
     def _bin_kind(shape) -> str:

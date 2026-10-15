@@ -30,21 +30,130 @@ def remove_dc(x: np.ndarray, sr: int, cutoff_hz: float = 5.0) -> np.ndarray:
     return signal.sosfiltfilt(sos, x, axis=-1).astype(np.float32)
 
 
-def resample_to(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
-    """Transparent polyphase resampling (Kaiser beta 12 -> >100 dB stopband)."""
+def resample_to(x: np.ndarray, sr_in: int, sr_out: int,
+                quality: str = "high") -> np.ndarray:
+    """Transparent polyphase resampling (Kaiser windowed)."""
     if sr_in == sr_out:
         return x.astype(np.float32)
     from fractions import Fraction
 
+    beta = 12.0 if quality == "high" else 16.0  # "ultra" -> wider stopband
     frac = Fraction(int(sr_out), int(sr_in)).limit_denominator(1024)
     y = signal.resample_poly(
         x.astype(np.float64),
         frac.numerator,
         frac.denominator,
         axis=-1,
-        window=("kaiser", 12.0),
+        window=("kaiser", beta),
     )
     return y.astype(np.float32)
+
+
+def measure_loudness(x: np.ndarray, sr: int) -> float | None:
+    """EBU R128 integrated loudness in LUFS; None when not measurable."""
+    try:
+        import pyloudnorm as pyln
+
+        meter = pyln.Meter(sr)
+        v = meter.integrated_loudness(x.T.astype(np.float64))
+        return float(v) if np.isfinite(v) else None
+    except Exception:
+        return None
+
+
+def true_peak(x: np.ndarray, sr: int, oversample: int = 4) -> float:
+    """Approximate true peak (oversampled) in linear units."""
+    if x.size == 0:
+        return 0.0
+    up = signal.resample_poly(x.astype(np.float64), oversample, 1, axis=-1,
+                              window=("kaiser", 8.0))
+    return float(np.max(np.abs(up)))
+
+
+def declip(x: np.ndarray, sr: int, thresh: float = 0.98) -> np.ndarray:
+    """Detect clipped regions and rebuild them by interpolation.
+
+    Simple but effective for ISPs/encoder overs: every run of samples pinned
+    at >= thresh is replaced with a smooth interpolation slightly *above* the
+    clip level, then gently lowpassed to avoid splats.
+    """
+    x = x.astype(np.float32, copy=True)
+    n = x.shape[-1]
+    for ch in range(x.shape[0] if x.ndim > 1 else 1):
+        row = np.atleast_2d(x)[ch]
+        clip = np.abs(row) >= thresh
+        if not clip.any():
+            continue
+        # find runs
+        idx = np.flatnonzero(clip)
+        runs = np.split(idx, np.where(np.diff(idx) != 1)[0] + 1)
+        for run in runs:
+            a, b = run[0], run[-1]
+            if a < 1 or b > n - 2:
+                row[run] = np.sign(row[run]) * thresh * 0.995
+                continue
+            left, right = row[a - 1], row[b + 1]
+            interp = np.linspace(left, right, run.size + 2)[1:-1]
+            peak = np.sign(left) * max(abs(left), abs(right), thresh) * 1.003
+            bulge = np.sin(np.linspace(0, np.pi, run.size))
+            row[run] = interp + bulge * (peak - interp) * 0.7
+        out = np.atleast_2d(x)
+        out[ch] = row
+        x = out
+    return x
+
+
+def spectral_gate(x: np.ndarray, sr: int, strength: float = 1.5,
+                  percentile: float = 20.0) -> np.ndarray:
+    """Lightweight spectral-subtraction / Wiener-ish denoiser.
+
+    Learns a per-frequency noise profile from the quietest frames and
+    attenuates towards it. strength ~1.0 mild, ~2.0 aggressive.
+    """
+    n = x.shape[-1]
+    if n < 4096 or strength <= 0:
+        return x.astype(np.float32)
+    nperseg = 1024
+    f, t, Z = signal.stft(x, fs=sr, nperseg=nperseg, noverlap=nperseg // 2,
+                          axis=-1)
+    mag = np.abs(Z)
+    frame_e = mag.mean(axis=-2, keepdims=True)  # per frame energy
+    thr = np.percentile(frame_e, percentile, axis=-1, keepdims=True)
+    quiet = frame_e <= thr
+    noise = np.full(mag.shape[:2] + (1,), _EPS, dtype=np.float32)
+    if quiet.sum() >= 1:
+        sel = np.where(quiet, mag, np.nan)
+        noise = np.nanmedian(sel, axis=-1, keepdims=True)
+        noise = np.where(np.isfinite(noise), noise, _EPS)
+    gain = np.clip((mag - strength * noise) / (mag + _EPS), 0.0, 1.0)
+    # smooth mask along freq & time to avoid musical noise
+    gain = ndimage.uniform_filter(gain, size=(1, 3, 3))
+    Z2 = Z * gain
+    _, y = signal.istft(Z2, fs=sr, nperseg=nperseg, noverlap=nperseg // 2)
+    m = min(y.shape[-1], n)
+    out = x[..., :m].astype(np.float32) * 0.0
+    out[..., :m] = y[..., :m]
+    if m < n:
+        out = np.concatenate([out, x[..., m:]], axis=-1)
+    return out.astype(np.float32)
+
+
+def to_mid_side(x: np.ndarray) -> np.ndarray:
+    """Stereo (2, n) -> mid/side (2, n). Non-stereo passes through."""
+    if x.shape[0] != 2:
+        return x
+    m = (x[0] + x[1]) * 0.5
+    s = (x[0] - x[1]) * 0.5
+    return np.stack([m, s]).astype(np.float32)
+
+
+def from_mid_side(x: np.ndarray) -> np.ndarray:
+    """mid/side (2, n) -> stereo."""
+    if x.shape[0] != 2:
+        return x
+    l = x[0] + x[1]
+    r = x[0] - x[1]
+    return np.stack([l, r]).astype(np.float32)
 
 
 def estimate_bandwidth(x: np.ndarray, sr: int, thresh_db: float = -55.0) -> float:
