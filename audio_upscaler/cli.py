@@ -36,9 +36,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bit-depth", type=int, default=24, choices=(16, 24, 32))
     p.add_argument("--engine", default="dsp", choices=list(engine_status()))
     p.add_argument("--model", type=Path, default=None,
-                   help=".onnx model path (required for --engine onnx)")
+                   help=".onnx model path (required for --engine onnx). "
+                        "Chain several models with '+': "
+                        "\"backbone.onnx+spec_head.onnx\"")
     p.add_argument("--device", type=int, default=0,
                    help="GPU device index for DirectML")
+    p.add_argument("--no-gpu", action="store_true",
+                   help="force CPU for ONNX models (some big models compile "
+                        "slowly on DirectML)")
     p.add_argument("--preset", default="music", metavar="KEY",
                    help="DSP preset; also reads user presets JSON "
                         "(--compare for multiple)")
@@ -187,6 +192,7 @@ def run_cli(argv: list[str]) -> int:
             auto_preset=args.auto_preset, name_template=args.name_template,
             keep_tree=args.keep_tree, workers=args.workers,
             copy_metadata=not args.no_metadata,
+            use_dml=not args.no_gpu,
         )
 
     def header(extra: str = "") -> None:
@@ -209,8 +215,25 @@ def run_cli(argv: list[str]) -> int:
         return 0 if summary.succeeded == len(summary.reports) else 1
 
     def do_run(file_list, settings):
-        return run_batch(file_list, settings, progress=_print_progress,
-                         roots=roots)
+        import signal
+        import threading
+
+        force = threading.Event()
+
+        def _sig(*_a):
+            force.set()
+            print("\nStopping… (finishing / aborting safely)")
+
+        prev = signal.getsignal(signal.SIGINT)
+        try:
+            signal.signal(signal.SIGINT, _sig)
+            return run_batch(file_list, settings, progress=_print_progress,
+                             roots=roots, force=force, cancel=force)
+        finally:
+            try:
+                signal.signal(signal.SIGINT, prev)
+            except Exception:
+                pass
 
     try:
         if args.compare:

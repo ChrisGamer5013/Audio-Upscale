@@ -48,6 +48,7 @@ class App(ctk.CTk):
 
         self._msg_q: queue.Queue = queue.Queue()
         self._cancel = threading.Event()
+        self._force = threading.Event()
         self._worker: threading.Thread | None = None
         self._files: list[Path] = []
         self._formats = available_output_formats()
@@ -87,6 +88,7 @@ class App(ctk.CTk):
         ("auto_preset", "auto_preset_var"), ("declip", "declip_var"),
         ("mid_side", "ms_var"), ("ultra", "ultra_var"),
         ("keep_tree", "keeptree_var"), ("nometa", "nometa_var"),
+        ("gpu", "use_dml_var"),
     )
 
     def _collect_prefs(self) -> dict:
@@ -244,6 +246,16 @@ class App(ctk.CTk):
         dev_lbl.pack(anchor="w", pady=(6, 0))
         self.device_var = tk.StringVar(value="0")
         ctk.CTkEntry(self.model_frame, textvariable=self.device_var, width=60).pack(anchor="w")
+        self.use_dml_var = tk.BooleanVar(value=True)
+        ctk.CTkSwitch(self.model_frame,
+                      text="GPU acceleration (DirectML)",
+                      variable=self.use_dml_var).pack(anchor="w", pady=(4, 0))
+        ctk.CTkLabel(
+            self.model_frame,
+            text="Chain models with + (e.g. backbone.onnx+spec_head.onnx). "
+                 "Uncheck GPU if a big model takes very long to compile.",
+            wraplength=300, justify="left", text_color="#999",
+            font=ctk.CTkFont(size=11)).pack(anchor="w")
         from ..recommendations import gpu_vram_map
         vram = dict(gpu_vram_map())
         if hw:
@@ -359,6 +371,11 @@ class App(ctk.CTk):
                                         state="disabled", fg_color="#8a2b2b",
                                         hover_color="#712020")
         self.cancel_btn.grid(row=0, column=1, padx=4)
+        self.force_btn = ctk.CTkButton(act, text="✖ Force Stop",
+                                       command=self._force_stop_batch,
+                                       state="disabled", fg_color="#5a1f1f",
+                                       hover_color="#431515")
+        self.force_btn.grid(row=0, column=2, padx=4)
         self.preview_btn = ctk.CTkButton(act, text="Preview", width=80,
                                          command=self._preview)
         self.preview_btn.grid(row=0, column=3, padx=4)
@@ -502,28 +519,44 @@ class App(ctk.CTk):
     def _on_drop(self, event) -> None:
         data = event.data
         paths = re.findall(r"\{([^}]*)\}|(\S+)", data)
+        model_paths: list[Path] = []
         for brace, bare in paths:
             p = Path(brace or bare)
             if not p.name:
                 continue
             if p.suffix.lower() == ".onnx" and p.is_file():
-                # model dropped: copy into models/ and select it
-                import shutil as _sh
-
-                dest = _models_dir() / p.name
-                try:
-                    if p.resolve() != dest.resolve():
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        _sh.copy2(p, dest)
-                except Exception as exc:
-                    messagebox.showerror("Model import failed", str(exc))
-                    continue
-                self.engine_label_var.set(MODEL_LABELS["onnx"])
-                self._on_engine_change(MODEL_LABELS["onnx"])
-                self.model_var.set(str(dest))
-                self._refresh_model_list()
+                model_paths.append(p)
             else:
                 self._add_paths([p])
+        if model_paths:
+            self._select_models(model_paths)
+
+    def _select_models(self, models: list[Path]) -> None:
+        """Copy model files into models/ and select them (multiple = chain)."""
+        import shutil as _sh
+
+        dests: list[Path] = []
+        for p in models:
+            dest = _models_dir() / p.name
+            try:
+                if p.resolve() != dest.resolve():
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    _sh.copy2(p, dest)
+            except Exception as exc:
+                messagebox.showerror("Model import failed", str(exc))
+                continue
+            dests.append(dest)
+        if not dests:
+            return
+        self.engine_label_var.set(MODEL_LABELS["onnx"])
+        self._on_engine_change(MODEL_LABELS["onnx"])
+        if len(dests) == 1:
+            self.model_var.set(str(dests[0]))
+        else:
+            self.model_var.set("+".join(str(d) for d in dests))
+            self.progress_lbl.configure(
+                text=f"Chained {len(dests)} models with '+'")
+        self._refresh_model_list()
 
     def _add_paths(self, paths: list[Path]) -> None:
         added = 0
@@ -598,10 +631,12 @@ class App(ctk.CTk):
             self.model_var.set(path)
 
     def _browse_model(self) -> None:
-        p = filedialog.askopenfilename(
-            title="Select ONNX model", filetypes=[("ONNX model", "*.onnx")])
-        if p:
-            self.model_var.set(p)
+        paths = filedialog.askopenfilenames(
+            title="Select ONNX model(s) — multiple = chain",
+            filetypes=[("ONNX model", "*.onnx")])
+        if paths:
+            self.model_var.set(
+                "+".join(str(Path(p)) for p in paths))
 
     def _browse_outdir(self) -> None:
         d = filedialog.askdirectory(title="Select output folder")
@@ -665,6 +700,7 @@ class App(ctk.CTk):
             keep_tree=self.keeptree_var.get(),
             workers=max(1, min(8, _int(self.workers_var, 1))),
             copy_metadata=not self.nometa_var.get(),
+            use_dml=self.use_dml_var.get(),
         )
 
     # ------------------------------------------------- About-tab actions
@@ -755,7 +791,8 @@ class App(ctk.CTk):
             from ..presets import PRESETS
 
             engine = create_engine(settings.engine_id, settings.model_path,
-                                   settings.device_id)
+                                   settings.device_id,
+                                   use_dml=settings.use_dml)
             reports = []
             total = len(PRESETS)
             for i, key in enumerate(PRESETS):
@@ -836,8 +873,10 @@ class App(ctk.CTk):
         save_settings(self._collect_prefs())
 
         self._cancel.clear()
+        self._force.clear()
         self.start_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
+        self.force_btn.configure(state="normal")
         self.progress.set(0.0)
         self.progress_lbl.configure(text="Starting…")
 
@@ -858,14 +897,22 @@ class App(ctk.CTk):
 
         try:
             summary = run_batch(flat, settings, progress=cb,
-                                cancel=self._cancel, roots=roots)
+                                cancel=self._cancel, roots=roots,
+                                force=self._force)
             self._msg_q.put(("done", summary))
         except Exception as exc:
             self._msg_q.put(("error", str(exc)))
 
     def _cancel_batch(self) -> None:
         self._cancel.set()
-        self.progress_lbl.configure(text="Cancelling after current file…")
+        self.progress_lbl.configure(text="Finishing current file…")
+
+    def _force_stop_batch(self) -> None:
+        self._force.set()
+        self._cancel.set()
+        self._files.clear()
+        self._refresh_list()
+        self.progress_lbl.configure(text="Force stopping now…")
 
     def _poll_queue(self) -> None:
         try:
@@ -883,10 +930,16 @@ class App(ctk.CTk):
                     self._summary = msg[1]
                     self.start_btn.configure(state="normal")
                     self.cancel_btn.configure(state="disabled")
+                    self.force_btn.configure(state="disabled")
                     self.open_btn.configure(state="normal")
                     ok = self._summary.succeeded
                     tot = len(self._summary.reports)
                     self.progress.set(1.0)
+                    if self._summary.cancelled:
+                        self.progress_lbl.configure(
+                            text=f"Stopped: {ok}/{tot} processed")
+                        self.file_lbl.configure(text="")
+                        return
                     self.progress_lbl.configure(text=f"Done: {ok}/{tot} succeeded")
                     self.file_lbl.configure(text="")
                     failed = [r for r in self._summary.reports if not r.ok]
@@ -898,6 +951,7 @@ class App(ctk.CTk):
                 elif kind == "error":
                     self.start_btn.configure(state="normal")
                     self.cancel_btn.configure(state="disabled")
+                    self.force_btn.configure(state="disabled")
                     self.progress_lbl.configure(text=f"Error: {msg[1]}")
                     messagebox.showerror("Error", msg[1])
                 elif kind == "preview":
@@ -977,7 +1031,8 @@ class App(ctk.CTk):
                 return
             tmpdir = Path(tempfile.mkdtemp(prefix="au_preview_"))
             engine = create_engine(settings.engine_id, settings.model_path,
-                                   settings.device_id)
+                                   settings.device_id,
+                                   use_dml=settings.use_dml)
             preset = PRESETS[settings.preset]
 
             from ..audio_io import read_audio

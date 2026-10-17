@@ -1,30 +1,26 @@
 """ONNX engine: runs user-provided ONNX models of (almost) any I/O layout.
 
-Supported model kinds (auto-detected from input/output tensor shapes, with
-optional overrides via a ``<model>.json`` sidecar file):
+Model kinds (auto-detected; `<model>.json` sidecar can override):
 
-  waveform     [B, T] / [B, 1, T] -> same layout       (super-res nets, etc.)
-  mel2mel      [B, n_mels, F] -> [B, n_mels, F']       (AudioSR, VoiceFixer…)
-               output is rebuilt to audio with Griffin-Lim
-  mel2wave     [B, n_mels, F] -> [B, 1, T]             (HiFi-GAN vocoders…)
-  stft2stft    [B, F, T] / [B, 2, F, T] -> same/comp.  (NSNet2, DeepFilterNet…)
-               2-channel output is treated as complex audio; a 1-channel
-               output with F == F_in is applied as a time-freq mask
-  stft2wave    [B, F, T] -> [B, 1, T]
+  waveform        [B, T] / [B, 1, T] -> same
+  mel2mel         [B, n_mels, F] -> [B, n_mels, F']     (Griffin-Lim back-end)
+  mel2wave        [B, n_mels, F] -> [B, 1, T]           (vocoders)
+  stft2stft       [B, F, T] masks / [B, 2, F, T] patches (denoisers)
+  stft2wave       [B, F, T] -> [B, 1, T]
+  *2stft (pair)   two outputs (real, imag) -> complex ISTFT back to audio
+  chain           "a.onnx+b.onnx": outputs of a feed inputs of b, then the
+                  kind is derived from first input / last output
+  generic         best effort
 
-Sidecar ``<model>.json`` options (all optional)::
-
-    {"kind": "mel2mel", "sample_rate": 44100, "n_fft": 1024, "hop": 256,
-     "win": 1024, "n_mels": 80, "fmin": 0, "fmax": 8000, "power": 1,
-     "log": "log10", "top_db": 80, "gl_iters": 24,
-     "chunk_frames": 300, "overlap_frames": 64}
-
-Acceleration: DirectML (AMD / Intel / NVIDIA on Windows), then CUDA (if
-installed), then CPU.
+Fix notes (v0.2.1): symbolic batch dims like ['batch', 80, 'frames'] are
+handled correctly (bin detection no longer assumes a leading static dim);
+name hints decide mel vs stft when dims are symbolic; complex-pair outputs
+and fixed-shape patch models are supported.
 """
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -37,9 +33,15 @@ from ..spectral import (
 )
 from .base import ProcessResult, ProgressCb
 
-_CHUNK = 1 << 18            # waveform models: samples per inference chunk
-_CHUNK_FRAMES = 300         # spectral models: frames per chunk
+_CHUNK = 1 << 18
+_CHUNK_FRAMES = 300
 _OVERLAP_FRAMES = 64
+
+_MEL_DIMS = {64, 80, 96, 128, 192, 224, 256}
+_STFT_DIMS = {161, 201, 257, 321, 401, 513, 641, 1025, 2049}
+_MEL_NAME_HINTS = ("mel", "fbank")
+_STFT_NAME_HINTS = ("stft", "spec", "mag", "noisy", "dft")
+_SPECTRAL_NAME_HINTS = _MEL_NAME_HINTS + _STFT_NAME_HINTS
 
 
 def _import_ort():
@@ -53,42 +55,77 @@ def _import_ort():
     return ort
 
 
-_SPECTRAL_NAME_HINTS = ("mel", "spec", "stft", "fbank", "noisy", "mag")
-_MEL_DIMS = {64, 80, 96, 128, 192, 224, 256}
-_STFT_DIMS = {161, 201, 257, 321, 401, 513, 641, 1025, 2049}
+def _bin_dims(shape) -> list[int]:
+    """Static dims that look like frequency bins (all > 4)."""
+    return [d for d in shape if isinstance(d, int) and d > 4]
 
 
-def _static_dims(shape) -> list[int]:
-    return [d for d in shape if isinstance(d, int)]
-
-
-def _spectral_hint(name: str, dims: list[int]) -> bool:
-    return any(h in name for h in _SPECTRAL_NAME_HINTS) or bool(
-        _MEL_DIMS.intersection(dims) or _STFT_DIMS.intersection(dims)
-    )
-
-
-def _bin_kind(shape) -> str:
-    dims = _static_dims(shape)[1:]
+def _bin_kind(shape, name: str = "") -> str:
+    n = (name or "").lower()
+    if any(h in n for h in _MEL_NAME_HINTS):
+        return "mel"
+    dims = _bin_dims(shape)
     if _MEL_DIMS.intersection(dims):
         return "mel"
     return "stft"
 
 
-def _classify_io(inp, out) -> str:
-    ishape = list(inp.shape or [])
-    oshape = list(out.shape or [])
-    iname = inp.name.lower()
-    oname = out.name.lower()
-    rank_o = len(oshape)
+def _spectral_hint(name: str, shape) -> bool:
+    n = (name or "").lower()
+    if any(h in n for h in _SPECTRAL_NAME_HINTS):
+        return True
+    dims = _bin_dims(shape)
+    return bool(_MEL_DIMS.intersection(dims) or _STFT_DIMS.intersection(dims))
 
-    i_spec = _spectral_hint(iname, _static_dims(ishape)[1:])
-    o_spec = _spectral_hint(oname, _static_dims(oshape)[1:])
+
+def _embedding_hint(outs: list) -> bool:
+    """Heuristic: a single output that looks like a latent/backbone feature
+    matrix (e.g. [batch, frames, 512] 'hidden'), not audio or a spectrogram."""
+    if len(outs) >= 2:
+        return False
+    out = outs[0]
+    name = (out.name or "").lower()
+    shape = list(out.shape or [])
+    last = shape[-1] if shape else None
+    hints = ("hidden", "embed", "latent", "feature", "feat")
+    return any(h in name for h in hints) or (
+        len(shape) == 3 and isinstance(last, int)
+        and last in (256, 384, 512, 768, 1024, 1280)
+        and not _spectral_hint(out.name, shape)
+    )
+
+
+def _embedding_input_hint(inp) -> bool:
+    """Heuristic: input that looks like a latent/backbone feature matrix
+    (e.g. [batch, frames, 512] 'hidden'), i.e. a head/decoder stage."""
+    name = (inp.name or "").lower()
+    shape = list(inp.shape or [])
+    last = shape[-1] if shape else None
+    hints = ("hidden", "embed", "latent", "feature", "feat")
+    return any(h in name for h in hints) or (
+        len(shape) == 3 and isinstance(last, int)
+        and last in (256, 384, 512, 768, 1024, 1280)
+        and not _spectral_hint(inp.name, shape)
+    )
+
+
+def _classify_io(inp, outs: list) -> str:
+    i_spec = _spectral_hint(inp.name, inp.shape or [])
+    oshape = list(outs[0].shape or [])
+    rank_o = len(oshape)
+    o_spec = _spectral_hint(outs[0].name, oshape)
     o_wave = rank_o in (2, 3) and not o_spec
+    mel = _bin_kind(inp.shape or [], inp.name) == "mel"
+
+    if len(outs) >= 2:
+        # (real, imag) pair -> complex spectrogram reconstruction
+        if i_spec:
+            return "mel2stft" if mel else "stft2stft"
+        return "generic"
     if i_spec and o_wave:
-        return "mel2wave" if _bin_kind(ishape) == "mel" else "stft2wave"
+        return "mel2wave" if mel else "stft2wave"
     if i_spec and o_spec:
-        return "mel2mel" if _bin_kind(ishape) == "mel" else "stft2stft"
+        return "mel2mel" if mel else "stft2stft"
     if not i_spec and not o_wave:
         return "generic"
     return "waveform"
@@ -97,15 +134,25 @@ def _classify_io(inp, out) -> str:
 class OnnxEngine:
     name = "onnx"
 
-    def __init__(self, model_path: str | Path, device_id: int = 0):
+    def __init__(self, model_path: str | Path, device_id: int = 0,
+                 use_dml: bool = True):
         self.ort = _import_ort()
-        self.model_path = Path(model_path)
-        if not self.model_path.is_file():
-            raise FileNotFoundError(f"Model not found: {self.model_path}")
+        raw = str(model_path)
+        parts = [Path(p.strip()) for p in raw.split("+") if p.strip()]
+        if not parts:
+            raise FileNotFoundError("No model given.")
+        for p in parts:
+            if not p.is_file():
+                raise FileNotFoundError(f"Model not found: {p}")
+        self.model_paths = parts
+        self.model_path = parts[-1]  # display name = last stage
+
+        import os
 
         available = self.ort.get_available_providers()
         providers: list = []
-        if "DmlExecutionProvider" in available:
+        if use_dml and os.environ.get("AU_NO_DML") != "1" and \
+                "DmlExecutionProvider" in available:
             providers.append(("DmlExecutionProvider", {"device_id": device_id}))
         if "CUDAExecutionProvider" in available:
             providers.append("CUDAExecutionProvider")
@@ -113,33 +160,72 @@ class OnnxEngine:
 
         opts = self.ort.SessionOptions()
         opts.log_severity_level = 3
-        try:
-            self.session = self.ort.InferenceSession(
-                str(self.model_path), sess_options=opts, providers=providers
-            )
-        except Exception:
-            # GPU provider present but broken (driver etc.) -> bare CPU
-            self.session = self.ort.InferenceSession(
-                str(self.model_path), sess_options=opts,
-                providers=["CPUExecutionProvider"],
-            )
-        self.ins = self.session.get_inputs()
-        self.outs = self.session.get_outputs()
-
-        # sidecar config
-        self.sidecar: dict = {}
-        side = self.model_path.with_suffix(".json")
-        if side.is_file():
+        self.sessions = []
+        for p in parts:
             try:
-                self.sidecar = json.loads(side.read_text(encoding="utf-8"))
-            except Exception as exc:
-                raise RuntimeError(f"Unreadable sidecar {side.name}: {exc}")
+                self.sessions.append(self.ort.InferenceSession(
+                    str(p), sess_options=opts, providers=providers))
+            except Exception:
+                self.sessions.append(self.ort.InferenceSession(
+                    str(p), sess_options=opts,
+                    providers=["CPUExecutionProvider"]))
 
-        self.kind = self.sidecar.get("kind") or self._classify()
+        self.ins = self.sessions[0].get_inputs()
+        self.outs = self.sessions[-1].get_outputs()
+        self.complex_pair = len(self.outs) >= 2
+
+        # sidecar config merged from all chain stages (later stages override)
+        self.sidecar: dict = {}
+        for p in parts:
+            side = p.with_suffix(".json")
+            if side.is_file():
+                try:
+                    data = json.loads(side.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    raise RuntimeError(f"Unreadable sidecar {side.name}: {exc}")
+                if isinstance(data, dict):
+                    self.sidecar.update(data)
+
+        self.kind = self.sidecar.get("kind") or _classify_io(self.ins[0],
+                                                             list(self.outs))
         self.input_rank = len(self.ins[0].shape or [])
+        self.patch_mode = self._detect_patch_mode()
         self._fixed_len = self._fixed_time_len()
         self._spec_params: SpecParams | None = None
+        self._guard_embedding_only()
         self._probe()
+
+    def _guard_embedding_only(self) -> None:
+        """A backbone/latent model alone cannot output audio - tell the user
+        to chain it with its head instead of producing garbage."""
+        if self.sidecar.get("kind") or self.patch_mode:
+            return
+        if len(self.sessions) == 1 and _embedding_input_hint(self.ins[0]):
+            raise RuntimeError(
+                f"'{self.model_path.name}' looks like a head/decoder stage "
+                f"(input '{self.ins[0].name}' {list(self.ins[0].shape or [])} "
+                "is a latent feature matrix), so it needs its backbone "
+                "model in front of it.\\n\\n"
+                "Chain it after its backbone using '+':\\n"
+                f'  --model "backbone.onnx+{self.model_path.name}"\\n'
+                "in the GUI: select the backbone first, then this file (or "
+                "type the two paths joined with '+'). See models\\\\README.md."
+            )
+        if len(self.sessions) > 1 or self.complex_pair:
+            return
+        if not _embedding_hint(list(self.outs)):
+            return
+        out = self.outs[0]
+        shape = list(out.shape or [])
+        raise RuntimeError(
+                f"'{self.model_path.name}' looks like a feature/backbone "
+                f"stage (output '{out.name}' {shape}), not a complete "
+                "model - running it alone would produce noise.\n\n"
+                "Chain it with its head model using '+':\n"
+                f'  --model "{self.model_path.name}+spec_head.onnx"\n'
+                "in the GUI: select both files (drag the second one) or type "
+                "them joined with '+'. See models\\README.md."
+            )
 
     @classmethod
     def inspect(cls, model_path: str | Path) -> str:
@@ -147,55 +233,109 @@ class OnnxEngine:
         ort = _import_ort()
         sopts = ort.SessionOptions()
         sopts.log_severity_level = 3
-        sess = ort.InferenceSession(str(model_path), sess_options=sopts,
-                                    providers=["CPUExecutionProvider"])
-        ins, outs = sess.get_inputs(), sess.get_outputs()
-        del sess
-        return _classify_io(ins[0], outs[0])
+        parts = [Path(p.strip()) for p in str(model_path).split("+") if p.strip()]
+        first = ort.InferenceSession(str(parts[0]), sess_options=sopts,
+                                     providers=["CPUExecutionProvider"])
+        last = first if len(parts) == 1 else ort.InferenceSession(
+            str(parts[-1]), sess_options=sopts,
+            providers=["CPUExecutionProvider"])
+        ins, outs = first.get_inputs(), last.get_outputs()
+        del first, last
+        if len(parts) == 1 and _embedding_input_hint(ins[0]):
+            return "head (chain after backbone: a.onnx+b.onnx)"
+        if _embedding_hint(list(outs)):
+            return "backbone (chain with head: a.onnx+b.onnx)"
+        return _classify_io(ins[0], list(outs))
 
-    # ---------------------------------------------------------- classify
-    def _classify(self) -> str:
-        return _classify_io(self.ins[0], self.outs[0])
-
-
-
-    @staticmethod
-    def _bin_kind(shape) -> str:
-        dims = _static_dims(shape)[1:]
-        if _MEL_DIMS.intersection(dims):
-            return "mel"
-        return "stft"
+    # ---------------------------------------------------------- shapes
+    def _detect_patch_mode(self) -> bool:
+        """Fixed small spectral patches e.g. [1, 2, 63, 257] (denoisers)."""
+        shape = list(self.ins[0].shape or [])
+        if len(shape) < 3:
+            return False
+        dims = [d for d in shape if isinstance(d, int)]
+        if len(dims) < len(shape) - 1:      # not fully fixed
+            return False
+        return (2 in dims and any(d in _STFT_DIMS for d in dims)
+                and max(dims) <= 2048)
 
     def _fixed_time_len(self) -> int | None:
         shape = list(self.ins[0].shape or [])
-        d = shape[-1]
-        if isinstance(d, int) and d >= 64 and self.kind == "waveform":
-            return d
-        if self.kind == "waveform" and len(shape) == 2 and isinstance(shape[1], int) \
-                and shape[1] >= 256:
-            return shape[1]
+        if self.patch_mode:
+            return None
+        if self.kind == "waveform":
+            d = shape[-1]
+            if isinstance(d, int) and d >= 64:
+                return d
+            if len(shape) == 2 and isinstance(shape[1], int) and shape[1] >= 256:
+                return shape[1]
         return None
 
-    # ---------------------------------------------------------- helpers
-    def _feed(self, main: np.ndarray) -> dict:
-        """Build the feed dict; extra inputs get zeros of their static shape."""
-        feed = {self.ins[0].name: main.astype(np.float32)}
-        for meta in self.ins[1:]:
-            dims = [d if isinstance(d, int) else 1 for d in (meta.shape or [])]
-            feed[meta.name] = np.zeros(dims or [1], dtype=np.float32)
-        return feed
+    def _feature_bins(self) -> int:
+        dims = _bin_dims(self.ins[0].shape or [])
+        for d in dims:
+            if d in _MEL_DIMS or d in _STFT_DIMS:
+                return d
+        name = self.ins[0].name.lower()
+        if any(h in name for h in _MEL_NAME_HINTS):
+            return 80
+        return 513
 
-    def _run(self, arr: np.ndarray) -> np.ndarray:
-        out = self.session.run(None, self._feed(arr))[0]
-        return np.asarray(out, dtype=np.float32)
+    # ---------------------------------------------------------- running
+    def _relax(self, meta, arr: np.ndarray) -> np.ndarray:
+        """Fit `arr` to a tensor's expected rank (pad/trim leading dims)."""
+        want = len(meta.shape or [])
+        while arr.ndim < want:
+            arr = arr[None]
+        while arr.ndim > want:
+            arr = arr.reshape(arr.shape[arr.ndim - want:]) if arr.ndim > 2 \
+                else arr.reshape((-1,))
+        return arr.astype(np.float32)
+
+    def _run_chain(self, arr: np.ndarray) -> list[np.ndarray]:
+        """Feed arr through all sessions; returns flattened last outputs."""
+        cur = [arr]
+        for si, sess in enumerate(self.sessions):
+            n_in = len(sess.get_inputs())
+            feed = {}
+            for idx, meta in enumerate(sess.get_inputs()):
+                if idx < len(cur):
+                    a = cur[idx]
+                    # match the model's expected layout where possible
+                    if si == 0:
+                        a = self._fit_main_input(a, meta)
+                    else:
+                        a = self._relax(meta, a)
+                else:
+                    dims = [d if isinstance(d, int) else 1
+                            for d in (meta.shape or [])]
+                    a = np.zeros(dims or [1], dtype=np.float32)
+                feed[meta.name] = a
+            cur = [np.asarray(o, dtype=np.float32)
+                   for o in sess.run(None, feed)]
+        return [o.reshape(-1) for o in cur]
+
+    def _fit_main_input(self, arr: np.ndarray, meta) -> np.ndarray:
+        if self.patch_mode:
+            return arr.astype(np.float32)
+        if arr.ndim >= self.input_rank:
+            return arr.astype(np.float32)
+        if self.input_rank == 2:
+            return arr.reshape(-1)[None, :]
+        if self.input_rank == 3 and arr.ndim == 2:
+            return arr[None]
+        return arr
 
     def _probe(self) -> None:
-        """Fail fast at load time with a clear message instead of per-file."""
         try:
             if self.kind == "waveform":
                 n = self._fixed_len or 4096
                 x = np.zeros(n, dtype=np.float32)
                 inp = x[None, :] if self.input_rank == 2 else x[None, None, :]
+            elif self.patch_mode:
+                shape = [d if isinstance(d, int) else 1
+                         for d in (self.ins[0].shape or [])]
+                inp = np.zeros(shape or [1, 2, 63, 257], dtype=np.float32)
             else:
                 f_dim = self._feature_bins()
                 t = int(self.sidecar.get("chunk_frames", _CHUNK_FRAMES))
@@ -206,43 +346,26 @@ class OnnxEngine:
                     inp = np.zeros((1, f_dim, t), np.float32)
                 else:
                     inp = np.zeros((1, 1, f_dim, t), np.float32)
-            y = self._run(inp)
+            ys = self._run_chain(inp)
         except Exception as exc:
             raise RuntimeError(
                 f"Model '{self.model_path.name}' ({self.kind}) failed its "
                 f"probe run. Input: '{self.ins[0].name}' "
                 f"{list(self.ins[0].shape or [])}.\n"
-                f"If the model needs non-default STFT/mel parameters, add a "
-                f"{self.model_path.stem}.json sidecar (see models\\README.md)."
+                f"For custom STFT/mel parameters add a "
+                f"{self.model_path.stem}.json sidecar (models\\README.md)."
                 f"\n\nOriginal error:\n{exc}"
             ) from exc
-        if y.size == 0 or not np.isfinite(y).all():
+        if not ys or any(y.size == 0 or not np.isfinite(y).all() for y in ys):
             raise RuntimeError(
-                f"Model '{self.model_path.name}' produced empty/invalid output "
-                "on the probe run."
+                f"Model '{self.model_path.name}' produced empty/invalid "
+                "output on the probe run."
             )
-
-    def _feature_bins(self) -> int:
-        dims = _static_dims(self.ins[0].shape or [])
-        for d in dims[1:]:
-            if d in _MEL_DIMS or d in _STFT_DIMS:
-                return d
-        return dims[-1] if dims else 80
-
-    def _params(self, sr: int) -> SpecParams:
-        if self.sidecar:
-            return SpecParams.from_json(self.sidecar, sr)
-        if self._spec_params is None or self._spec_params.sr != sr:
-            bins = self._feature_bins()
-            spectral = self._bin_kind(self.ins[0].shape) == "stft" \
-                or bins in _STFT_DIMS
-            self._spec_params = defaults_for_bins(bins, sr, spectral)
-        return self._spec_params
 
     # ---------------------------------------------------------- waveform
     def _infer_wave_chunk(self, chunk: np.ndarray) -> np.ndarray:
         inp = chunk[None, :] if self.input_rank == 2 else chunk[None, None, :]
-        return self._run(inp).reshape(-1)
+        return self._run_chain(inp)[0]
 
     def _wave_channel(self, x: np.ndarray) -> tuple[np.ndarray, float]:
         chunk_len = self._fixed_len or _CHUNK
@@ -287,7 +410,20 @@ class OnnxEngine:
         return acc[: int(round(n * ratio))], ratio
 
     # ---------------------------------------------------------- spectral
-    def _spectral_channel(self, x: np.ndarray, sr: int) -> np.ndarray:
+    def _params(self, sr: int) -> SpecParams:
+        if self.sidecar:
+            return SpecParams.from_json(self.sidecar, sr)
+        if self._spec_params is None or self._spec_params.sr != sr:
+            bins = self._feature_bins()
+            spectral = _bin_kind(self.ins[0].shape or [],
+                                 self.ins[0].name) == "stft"
+            self._spec_params = defaults_for_bins(bins, sr, spectral)
+        return self._spec_params
+
+    def _spectral_channel(self, x: np.ndarray, sr: int,
+                          report=None) -> np.ndarray:
+        if self.patch_mode:
+            return self._patch_channel(x, sr, report=report)
         p = self._params(sr)
         S = stft_complex(x, p)
         n_frames = S.shape[1]
@@ -300,6 +436,9 @@ class OnnxEngine:
 
         pos = 0
         while pos < n_frames:
+            if report and (pos // hop_f) % 8 == 0:
+                report(min(1.0, (pos + 1) / max(1, n_frames)),
+                       "ONNX inference")
             t_end = min(pos + step, n_frames)
             Sin = S[:, pos:t_end]
             phase_src = np.angle(Sin)
@@ -312,8 +451,8 @@ class OnnxEngine:
             else:
                 inp = feat[None, None]
 
-            y = self._run(inp).reshape(-1)
-            audio_seg = self._spectral_to_audio(y, Sin, phase_src, p)
+            ys = self._run_chain(inp)
+            audio_seg = self._spectral_to_audio(ys, Sin, phase_src, p)
             o = pos * p.hop
             w = np.ones(audio_seg.size, np.float32)
             f = min(ov * p.hop, audio_seg.size // 2)
@@ -332,44 +471,56 @@ class OnnxEngine:
         out_audio[good] /= norm[good]
         return out_audio[: x.size]
 
-    def _spectral_to_audio(self, y: np.ndarray, Sin: np.ndarray,
+    def _spectral_to_audio(self, ys: list[np.ndarray], Sin: np.ndarray,
                            phase_src: np.ndarray, p: SpecParams) -> np.ndarray:
         n_seg = (Sin.shape[1] - 1) * p.hop + p.win
-        os_ = list(self.outs[0].shape or [])
-        isr = list(self.ins[0].shape or [])
 
+        if self.complex_pair and len(ys) >= 2:
+            frames = Sin.shape[1]
+            F = ys[0].size // max(1, frames)
+            if F * frames != ys[0].size or F < 8:
+                F = Sin.shape[0]
+            re = ys[0][: F * frames].reshape(F, frames)
+            im = ys[1][: F * frames].reshape(F, frames)
+            S = (re + 1j * im).astype(np.complex64)
+            if F != Sin.shape[0]:
+                n_fft = 2 * (F - 1)
+                p2 = replace(p, n_fft=n_fft, win=max(64, n_fft),
+                             hop=min(p.hop, n_fft // 2))
+            else:
+                p2 = p
+            n_seg2 = (frames - 1) * p2.hop + p2.win
+            return istft_complex(S, p2, n_seg2)
+
+        y = ys[0] if ys else np.zeros(1, np.float32)
         if self.kind in ("mel2wave", "stft2wave"):
             expected = Sin.shape[1] * p.hop
             if y.size == expected:
                 return y[:expected]
-            # resample odd ratios to expected length
             return signal_resample_len(y, expected)
 
-        dims = _static_dims(os_)[1:]
-        two_ch = 2 in dims[:-1] if len(dims) > 1 else False
-        bins_in = self._feature_bins()
-
         if self.kind == "stft2stft":
-            f_out = y.size // max(1, Sin.shape[1] * (2 if two_ch else 1))
-            if two_ch or (f_out == Sin.shape[0] and y.size == Sin.size * 2):
-                c = y.reshape(2, Sin.shape[0], -1)
-                t = min(c.shape[2], Sin.shape[1])
-                Sout = (c[0][:, :t] + 1j * c[1][:, :t]).astype(np.complex64)
+            dims = _bin_dims(self.outs[0].shape or [])
+            two_ch = 2 in dims[:-1] if len(dims) > 1 else False
+            if two_ch:
+                c = y.reshape(2, -1)
+                frames = c.shape[1] // max(1, Sin.shape[0])
+                Sout = c[0].reshape(Sin.shape[0], -1) + 1j * \
+                    c[1].reshape(Sin.shape[0], -1)
+                t = min(Sout.shape[1], Sin.shape[1])
+                Sout = Sout[:, :t]
                 if t < Sin.shape[1]:
                     Sout = np.pad(Sout, ((0, 0), (0, Sin.shape[1] - t)))
-                return istft_complex(Sout, p, n_seg)
-            # magnitude/mask output: apply as mask
-            m = y.reshape(-1)[: Sin.size].reshape(Sin.shape) if y.size >= Sin.size \
-                else np.pad(y, (0, Sin.size - y.size)).reshape(Sin.shape)
+                return istft_complex(Sout.astype(np.complex64), p, n_seg)
+            m = y[: Sin.size].reshape(Sin.shape) if y.size >= Sin.size else \
+                np.pad(y, (0, Sin.size - y.size)).reshape(Sin.shape)
             m = np.clip(m, 0.0, 4.0)
-            Sout = (np.abs(Sin) * m.astype(np.float32)
-                    * np.exp(1j * phase_src.astype(np.float32)))
+            Sout = np.abs(Sin) * m.astype(np.float32) * \
+                np.exp(1j * phase_src.astype(np.float32))
             return istft_complex(Sout.astype(np.complex64), p, n_seg)
 
         # mel2mel
-        f_out = _static_dims(os_)[-2] if len(os_) >= 3 else bins_in
-        if f_out not in _MEL_DIMS and f_out != bins_in:
-            f_out = bins_in
+        f_out = self._feature_bins()
         frames = max(1, y.size // max(1, f_out))
         mel_out = y[: f_out * frames].reshape(f_out, frames)
         if frames < Sin.shape[1]:
@@ -383,15 +534,59 @@ class OnnxEngine:
         return griffin_lim(mag, p, init_phase=phase_src)[:n_seg] \
             if mag.size else np.zeros(n_seg, np.float32)
 
+    # ------------------------------------------------------- patch models
+    def _patch_channel(self, x: np.ndarray, sr: int, report=None) -> np.ndarray:
+        """Sliding-window run of fixed spectral-patch models (e.g. [1,2,63,257])."""
+        shape = [d if isinstance(d, int) else 1 for d in (self.ins[0].shape or [])]
+        f_patch = max(d for d in shape if d in _STFT_DIMS or d in _MEL_DIMS)
+        t_patch = max(s for s in shape if s != f_patch and s > 8)
+        time_first = shape[-1] == f_patch      # [.., T, F] patch layout
+        n_fft = 2 * (f_patch - 1)
+        p = replace(self._params(sr), n_fft=n_fft, win=n_fft,
+                    hop=int(self.sidecar.get("hop", max(64, n_fft // 4))))
+        S = stft_complex(x, p)
+        F, T = S.shape
+        out = S.copy()
+        step = max(1, t_patch - t_patch // 4)
+        win = np.hanning(t_patch + 2)[1:-1].astype(np.float32)
+        for t0 in range(0, T, step):
+            if report and (t0 // step) % 8 == 0:
+                report(min(1.0, (t0 + 1) / max(1, T)), "ONNX patch inference")
+            t1 = min(t0 + t_patch, T)
+            seg = S[:, t0:t1]
+            if seg.shape[1] < t_patch:
+                pad = t_patch - seg.shape[1]
+                seg = np.pad(seg, ((0, 0), (0, pad)))
+            seg_ri = np.stack([seg.real, seg.imag]).astype(np.float32)  # 2,F,T
+            if time_first:
+                ri = np.transpose(seg_ri, (0, 2, 1))[None]  # 1,2,T,F
+            else:
+                ri = seg_ri[None]                           # 1,2,F,T
+            ys = self._run_chain(ri)
+            y = ys[0]
+            chans = y.size // max(1, f_patch * t_patch)
+            if time_first:
+                out_ri = y[: chans * f_patch * t_patch].reshape(
+                    chans, t_patch, f_patch).transpose(0, 2, 1)
+            else:
+                out_ri = y[: chans * f_patch * t_patch].reshape(
+                    chans, f_patch, t_patch)
+            if chans >= 2:
+                enh = (out_ri[0] + 1j * out_ri[1]).astype(np.complex64)
+            else:
+                enh = (np.abs(seg) * np.clip(out_ri[0], 0, 4)).astype(np.complex64)
+            take = t1 - t0
+            w = win[:take]
+            out[:, t0:t1] = out[:, t0:t1] * (1 - w) + enh[:, :take] * w
+        return istft_complex(out.astype(np.complex64), p, x.size)
+
     # ---------------------------------------------------------- generic
     def _generic_channel(self, x: np.ndarray) -> np.ndarray:
-        """Unknown layout: feed the raw waveform, hope for the best."""
         inp = x[None].astype(np.float32)
         rank = self.input_rank
         for _ in range(rank - 2):
             inp = inp[:, None]
-        y = self._run(inp)
-        return y.reshape(-1)
+        return self._run_chain(inp)[0]
 
     # ---------------------------------------------------------- process
     def process(
@@ -407,15 +602,26 @@ class OnnxEngine:
                 progress(f, m)
 
         x = dsp.ensure_channels(x)
-        notes = [f"model: {self.model_path.name}", f"kind: {self.kind}"]
+        chain = " + ".join(p.name for p in self.model_paths)
+        notes = [f"model: {chain}", f"kind: {self.kind}"]
+        if self.patch_mode:
+            notes.append("patch mode")
 
-        if self.kind in ("mel2mel", "mel2wave", "stft2stft", "stft2wave",
-                         "generic"):
-            # spectral models work at one rate: pre-resample to target
+        if self.kind in ("mel2mel", "mel2wave", "mel2stft", "stft2stft",
+                         "stft2wave", "generic"):
             work = dsp.resample_to(x, sr, target_sr)
             chans = []
             for ci in range(work.shape[0]):
-                chans.append(self._spectral_channel(work[ci], target_sr))
+                base = 0.05 + 0.9 * ci / max(1, work.shape[0])
+                span = 0.9 / max(1, work.shape[0])
+
+                def _ch_report(f: float, m: str, base=base, span=span,
+                               ci=ci) -> None:
+                    report(base + span * f,
+                           f"ONNX inference (ch {ci + 1}/{work.shape[0]})")
+
+                chans.append(self._spectral_channel(work[ci], target_sr,
+                                                    report=_ch_report))
                 report(0.05 + 0.9 * (ci + 1) / work.shape[0],
                        f"ONNX inference (ch {ci + 1}/{work.shape[0]})")
             y = np.stack(chans)
@@ -439,6 +645,7 @@ class OnnxEngine:
             elif abs(ratio - 1.0) > 1e-3:
                 report(0.94, f"Resampling model output -> {target_sr} Hz")
                 from scipy import signal
+
                 new_len = int(round(x.shape[-1] * target_sr / sr))
                 y = signal.resample(y, new_len, axis=-1).astype(np.float32)
 

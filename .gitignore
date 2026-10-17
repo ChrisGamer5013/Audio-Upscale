@@ -16,9 +16,11 @@ build/
 dist/
 *.spec.bak
 
-# Trained models & demo outputs (keep models/README.md)
-models/*.onnx
-models/*.onnx.data
+# Models directory: keep local models local - only our own trained
+# starter model (and README.md) are tracked in git.
+models/*
+!models/starter_bwe_48k.onnx
+!models/README.md
 demo_*.wav
 demo_*.flac
 demo_*.png

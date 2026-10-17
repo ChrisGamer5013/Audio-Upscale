@@ -62,11 +62,14 @@ def pyinstaller_build() -> Path:
     app_dir = ROOT / "dist" / APP_NAME
     if not (app_dir / f"{APP_NAME}.exe").is_file():
         sys.exit("PyInstaller build failed - exe not found")
-    # bundle models/README + any local .onnx models (e.g. starter BWE)
+    # bundle models/README + our bundled starter BWE model only
+    # (never ship the user's own/test models in the portable build)
     (app_dir / "models").mkdir(exist_ok=True)
     shutil.copy2(ROOT / "models" / "README.md", app_dir / "models" / "README.md")
-    for model in (ROOT / "models").glob("*.onnx"):
-        shutil.copy2(model, app_dir / "models" / model.name)
+    for name in ("starter_bwe_48k.onnx",):
+        model = ROOT / "models" / name
+        if model.is_file():
+            shutil.copy2(model, app_dir / "models" / name)
     return app_dir
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -165,6 +166,141 @@ def test_onnx_stft_mask_identity_runs(tmp_path):
     x = _sweep(44_100, 0.25)
     out = eng.process(x, 44_100, 48_000, get_preset("reference"))
     assert out.sr == 48_000 and np.isfinite(out.audio).all()
+
+
+@pytest.mark.skipif(
+    not engine_status()["onnx"].startswith("ready"),
+    reason="onnxruntime not installed",
+)
+def test_onnx_symbolic_batch_dims(tmp_path):
+    """['batch', 80, 'frames'] mel models must classify as mel, not STFT
+    (regression: symbolic batch dims used to slice off the 80)."""
+    from audio_upscaler.engines.onnx_engine import OnnxEngine
+
+    m = tmp_path / "bb.onnx"
+    _make_identity_model(m, ["batch", 80, "frames"], "mel")
+    eng = OnnxEngine(m, use_dml=False)
+    assert eng.kind == "mel2mel"
+    assert eng._feature_bins() == 80
+    x = _sweep(44_100, 0.2)
+    out = eng.process(x, 44_100, 48_000, get_preset("reference"))
+    assert np.isfinite(out.audio).all()
+
+
+@pytest.mark.skipif(
+    not engine_status()["onnx"].startswith("ready"),
+    reason="onnxruntime not installed",
+)
+def test_onnx_backbone_guard(tmp_path):
+    """A bare latent/backbone model must refuse to run with a hint."""
+    from audio_upscaler.engines.onnx_engine import OnnxEngine
+
+    m = tmp_path / "backbone.onnx"
+    _make_identity_model(m, [1, 80, None], "mel")
+    # rewrite output to a latent: [batch, frames, 512] 'hidden'
+    onnx = pytest.importorskip("onnx")
+    model = onnx.load(str(m))
+    out = model.graph.output[0]
+    out.name = "hidden"
+    out.type.tensor_type.shape.dim[0].dim_param = "batch"
+    out.type.tensor_type.shape.dim[1].dim_value = 0  # clear
+    out.type.tensor_type.shape.dim[1].dim_param = "frames"
+    out.type.tensor_type.shape.dim[2].dim_value = 512
+    model.graph.node[0].output[0] = "hidden"
+    onnx.save(model, str(m))
+    with pytest.raises(RuntimeError, match="[Cc]hain"):
+        OnnxEngine(m, use_dml=False)
+
+
+@pytest.mark.skipif(
+    not engine_status()["onnx"].startswith("ready"),
+    reason="onnxruntime not installed",
+)
+def test_onnx_chain_two_stages(tmp_path):
+    """Two-stage chain: outputs of stage 1 feed stage 2; last-stage (real,
+    imag) pair becomes audio via complex ISTFT."""
+    from audio_upscaler.engines.onnx_engine import OnnxEngine
+
+    onnx = pytest.importorskip("onnx")
+
+    def save(nodes, name, ins, outs, path):
+        graph = onnx.helper.make_graph(nodes, name, ins, outs)
+        model = onnx.helper.make_model(
+            graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.save(model, str(path))
+
+    h = onnx.helper.make_tensor_value_info("hidden", onnx.TensorProto.FLOAT,
+                                           [1, 80, None])
+    save([onnx.helper.make_node("Identity", ["mel"], ["hidden"])],
+         "backbone",
+         [onnx.helper.make_tensor_value_info("mel", onnx.TensorProto.FLOAT,
+                                             [1, 80, None])],
+         [h], tmp_path / "backbone.onnx")
+    save([onnx.helper.make_node("Identity", ["hidden"], ["real"]),
+          onnx.helper.make_node("Identity", ["hidden"], ["imag"])],
+         "head",
+         [onnx.helper.make_tensor_value_info("hidden", onnx.TensorProto.FLOAT,
+                                             [1, 80, None])],
+         [onnx.helper.make_tensor_value_info("real", onnx.TensorProto.FLOAT,
+                                             [1, 80, None]),
+          onnx.helper.make_tensor_value_info("imag", onnx.TensorProto.FLOAT,
+                                             [1, 80, None])],
+         tmp_path / "head.onnx")
+
+    chain = f"{tmp_path / 'backbone.onnx'}+{tmp_path / 'head.onnx'}"
+    eng = OnnxEngine(chain, use_dml=False)
+    assert eng.kind == "mel2stft" and eng.complex_pair
+    x = _sweep(44_100, 0.2)
+    out = eng.process(x, 44_100, 48_000, get_preset("reference"))
+    assert np.isfinite(out.audio).all() and out.audio.shape[-1] > 0
+
+
+@pytest.mark.skipif(
+    not engine_status()["onnx"].startswith("ready"),
+    reason="onnxruntime not installed",
+)
+def test_onnx_patch_denoiser_runs(tmp_path):
+    """Fixed patch models like [1, 2, 63, 257] (time-first) run as a
+    sliding window and resynthesize audio."""
+    from audio_upscaler.engines.onnx_engine import OnnxEngine
+
+    m = tmp_path / "denoiser.onnx"
+    _make_identity_model(m, [1, 2, 63, 257], "spec_ri")
+    # rename output and keep shape
+    onnx = pytest.importorskip("onnx")
+    model = onnx.load(str(m))
+    model.graph.output[0].name = "enhanced_ri"
+    model.graph.node[0].output[0] = "enhanced_ri"
+    onnx.save(model, str(m))
+
+    eng = OnnxEngine(m, use_dml=False)
+    assert eng.patch_mode and eng.kind == "stft2stft"
+    x = _sweep(22_050, 0.2)
+    out = eng.process(x, 22_050, 48_000, get_preset("reference"))
+    assert np.isfinite(out.audio).all() and out.audio.shape[-1] > 0
+
+
+def test_force_stop_mid_file(tmp_path):
+    """Force stop aborts the current file mid-way and marks it cancelled."""
+    x = _sweep(22_050, 0.6)
+    src = tmp_path / "f.wav"
+    write_audio(src, x, 22_050, fmt="WAV", bit_depth=16)
+    settings = JobSettings(target_sr=48_000, fmt="FLAC", out_dir=tmp_path,
+                           preset="music", save_spectrograms=False,
+                           copy_metadata=False)
+    force = threading.Event()
+    calls = {"n": 0}
+
+    def prog(i, total, frac, msg, path):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            force.set()
+
+    summary = run_batch([src], settings, progress=prog, force=force)
+    assert summary.cancelled
+    assert len(summary.reports) == 1 and summary.reports[0].cancelled
+    assert summary.reports[0].message == "stopped"
 
 
 def test_provider_summary():

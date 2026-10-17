@@ -25,11 +25,12 @@ def engine_status() -> dict[str, str]:
 
 
 def create_engine(engine_id: str, model_path: str | None = None,
-                  device_id: int = 0) -> Engine:
+                  device_id: int = 0, use_dml: bool = True) -> Engine:
     if engine_id == "onnx":
         if not model_path:
             raise ValueError("The ONNX engine requires a .onnx model file.")
-        return OnnxEngine(model_path=model_path, device_id=device_id)
+        return OnnxEngine(model_path=model_path, device_id=device_id,
+                          use_dml=use_dml)
     return DspEngine()
 
 

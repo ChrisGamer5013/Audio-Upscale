@@ -234,5 +234,15 @@ def train(data_folder: Path, out_model: Path, sr: int = 48_000,
         dynamic_axes={"input": {2: "time"}, "output": {2: "time"}},
         opset_version=17,
     )
+    # torch's new exporter may split weights into <model>.onnx.data; merge
+    # into a single self-contained file so the model can be shipped alone.
+    data_file = Path(str(out_model) + ".data")
+    if data_file.exists():
+        import onnx
+
+        m = onnx.load(str(out_model))          # pulls in the external data
+        onnx.save(m, str(out_model))           # embeds it into one file
+        data_file.unlink(missing_ok=True)
+        log("merged external weights into a single .onnx file")
     log(f"exported -> {out_model}")
     return out_model

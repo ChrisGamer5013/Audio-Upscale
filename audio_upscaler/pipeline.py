@@ -47,6 +47,7 @@ class JobSettings:
     keep_tree: bool = False         # mirror source folder structure in out_dir
     workers: int = 1                # parallel files
     copy_metadata: bool = True
+    use_dml: bool = True            # False -> force CPU for ONNX models
 
 
 @dataclass
@@ -55,6 +56,7 @@ class FileReport:
     output: Path | None = None
     ok: bool = False
     message: str = ""
+    cancelled: bool = False
     notes: list[str] = field(default_factory=list)
     seconds_in: float = 0.0
     seconds_out: float = 0.0
@@ -165,14 +167,25 @@ def output_path_for(source: Path, settings: JobSettings, root: Path | None,
 # ------------------------------------------------------------------ per-file
 def process_file(path: Path, settings: JobSettings, engine,
                  progress: ProgressCb | None, index: int = 0,
-                 total: int = 1, root: Path | None = None) -> FileReport:
+                 total: int = 1, root: Path | None = None,
+                 force: threading.Event | None = None) -> FileReport:
     report = FileReport(source=path)
     t0 = time.perf_counter()
     cb = None
 
+    class _Forced(Exception):
+        """Raised from the progress callback to abort the current file."""
+
     def inner(frac: float, msg: str) -> None:
+        if force is not None and force.is_set():
+            raise _Forced()
         if progress:
             progress(index, total, frac, msg, path)
+
+    if force is not None and force.is_set():
+        report.cancelled = True
+        report.message = "stopped"
+        return report
 
     try:
         inner(0.02, "Reading")
@@ -234,6 +247,9 @@ def process_file(path: Path, settings: JobSettings, engine,
         report.output = out_path
         report.ok = True
         report.message = "ok"
+    except _Forced:
+        report.cancelled = True
+        report.message = "stopped"
     except Exception as exc:  # keep batch going
         report.ok = False
         report.message = str(exc)
@@ -271,43 +287,53 @@ def run_batch(
     progress: ProgressCb | None = None,
     cancel: threading.Event | None = None,
     roots: dict[Path, Path] | None = None,
+    force: threading.Event | None = None,
 ) -> BatchSummary:
     """Process files; `workers > 1` parallelizes independent files.
+
+    `cancel` stops after the current file; `force` aborts the current file
+    immediately (checked via the progress callback).
 
     DSP math runs in numpy/scipy which releases the GIL, so threads are
     enough; the ONNX session supports concurrent `run` calls.
     """
     engine = create_engine(settings.engine_id, settings.model_path,
-                           settings.device_id)
+                           settings.device_id, use_dml=settings.use_dml)
     summary = BatchSummary()
     total = len(files)
 
     def done_cb(rep: FileReport, i: int) -> None:
         summary.reports.append(rep)
+        if rep.cancelled:
+            summary.cancelled = True
         if progress:
             progress(i, total, 1.0, "done" if rep.ok else "FAILED",
                      rep.source)
 
+    def stopped() -> bool:
+        return ((cancel is not None and cancel.is_set())
+                or (force is not None and force.is_set()))
+
     workers = max(1, min(settings.workers, 8, total))
     if workers == 1:
         for i, path in enumerate(files):
-            if cancel is not None and cancel.is_set():
+            if stopped():
                 summary.cancelled = True
                 break
             rep = process_file(path, settings, engine, progress, i, total,
-                               (roots or {}).get(path))
+                               (roots or {}).get(path), force=force)
             done_cb(rep, i)
+            if rep.cancelled:
+                break
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(process_file, p, settings, engine, progress, i,
-                            total, (roots or {}).get(p)): i
+                            total, (roots or {}).get(p), force): i
                 for i, p in enumerate(files)
             }
             for fut in as_completed(futures):
                 i = futures[fut]
                 done_cb(fut.result(), i)
-                if cancel is not None and cancel.is_set():
-                    summary.cancelled = True
     summary.reports.sort(key=lambda r: str(r.source).lower())
     return summary
