@@ -939,15 +939,17 @@ class App(ctk.CTk):
                         self.progress_lbl.configure(
                             text=f"Stopped: {ok}/{tot} processed")
                         self.file_lbl.configure(text="")
-                        return
-                    self.progress_lbl.configure(text=f"Done: {ok}/{tot} succeeded")
-                    self.file_lbl.configure(text="")
-                    failed = [r for r in self._summary.reports if not r.ok]
-                    body = f"{ok}/{tot} files processed."
-                    if failed:
-                        body += "\n\nFailed:\n" + "\n".join(
-                            f"  {r.source.name}: {r.message}" for r in failed)
-                    messagebox.showinfo("Batch finished", body)
+                    else:
+                        self.progress_lbl.configure(
+                            text=f"Done: {ok}/{tot} succeeded")
+                        self.file_lbl.configure(text="")
+                        failed = [r for r in self._summary.reports if not r.ok]
+                        body = f"{ok}/{tot} files processed."
+                        if failed:
+                            body += "\n\nFailed:\n" + "\n".join(
+                                f"  {r.source.name}: {r.message}"
+                                for r in failed)
+                        messagebox.showinfo("Batch finished", body)
                 elif kind == "error":
                     self.start_btn.configure(state="normal")
                     self.cancel_btn.configure(state="disabled")
