@@ -9,7 +9,7 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -48,6 +48,7 @@ class JobSettings:
     workers: int = 1                # parallel files
     copy_metadata: bool = True
     use_dml: bool = True            # False -> force CPU for ONNX models
+    skip_existing: bool = False     # don't reprocess files whose output exists
 
 
 @dataclass
@@ -145,7 +146,7 @@ def format_output_name(template: str, source: Path, settings: JobSettings,
 
 
 def output_path_for(source: Path, settings: JobSettings, root: Path | None,
-                    preset_key: str) -> Path:
+                    preset_key: str, dedupe: bool = True) -> Path:
     base_dir = Path(settings.out_dir) if settings.out_dir else source.parent
     if settings.keep_tree and root and root != source.parent:
         try:
@@ -157,10 +158,11 @@ def output_path_for(source: Path, settings: JobSettings, root: Path | None,
     stem = format_output_name(settings.name_template, source, settings,
                               preset_key)
     out = base_dir / f"{stem}{ext}"
-    n = 2
-    while out.exists():
-        out = base_dir / f"{stem}_{n}{ext}"
-        n += 1
+    if dedupe:
+        n = 2
+        while out.exists():
+            out = base_dir / f"{stem}_{n}{ext}"
+            n += 1
     return out
 
 
@@ -190,15 +192,26 @@ def process_file(path: Path, settings: JobSettings, engine,
     try:
         inner(0.02, "Reading")
         x, sr = audio_io.read_audio(path)
-        report.seconds_in = x.shape[-1] / sr
-        report.in_lufs = dsp.measure_loudness(x, sr)
-        report.in_true_peak = dsp.true_peak(x, sr)
+        if not settings.target_sr or settings.target_sr <= 0:
+            settings = replace(settings, target_sr=sr)   # keep source rate
 
         preset_key = settings.preset
         if settings.auto_preset:
             preset_key = auto_pick_preset(x, sr)
             report.notes.append(f"auto preset: {preset_key}")
         preset = get_preset(preset_key)
+
+        planned = output_path_for(path, settings, root, preset_key,
+                                  dedupe=False)
+        if settings.skip_existing and planned.exists():
+            report.output = planned
+            report.ok = True
+            report.message = "skipped (output exists)"
+            return report
+
+        report.seconds_in = x.shape[-1] / sr
+        report.in_lufs = dsp.measure_loudness(x, sr)
+        report.in_true_peak = dsp.true_peak(x, sr)
 
         if settings.declip:
             inner(0.05, "De-clipping")

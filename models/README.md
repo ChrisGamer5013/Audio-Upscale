@@ -47,6 +47,26 @@ add a sidecar file named like the model, e.g. `mymodel.json` next to
 - Extra (secondary) model inputs are fed zeros of matching static shape —
   best-effort for stateful/LSTM models.
 - For patch models `hop` sets the STFT hop when resynthesizing
+- **Stereo waveform models** with input `[B, 2, T]` receive both channels at
+  once; mono files are duplicated and the model output is downmixed.
+- Waveform models with an **auxiliary second output** (e.g. `[wave, mask]`)
+  are still treated as waveform — only real/imag-style pairs become complex
+  spectrogram output.
+- Many exporters can embed sidecar values directly in the model
+  (`metadata_props`, e.g. `sample_rate`, `kind`, `n_fft`). A `<model>.json`
+  sidecar always overrides embedded metadata.
+
+Not sure what a model expects? Ask the engine:
+
+```bat
+main.py cli --list-models                 REM kind of every model in models\
+main.py cli --inspect-model path\to.onnx  REM full I/O report + sidecar template
+```
+
+In the GUI, the buttons under the model picker do the same: **Info** (I/O
+report), **Test** (2 s synthetic benchmark, reports kind + realtime speed),
+**Sidecar** (creates `<model>.json` from a template and opens it), and
+**Folder** (opens the models directory).
 
 ## Chaining split models (backbone + head)
 
@@ -55,7 +75,7 @@ Many projects split a vocoder into stages, e.g.:
 - `backbone.onnx`: `mel [B, 80, F]` → `hidden [B, F, 512]`
 - `spec_head.onnx`: `hidden [B, F, 512]` → `real [B, Fn, F]`, `imag [B, Fn, F]`
 
-Join them with **`+`** anywhere a model path is accepted:
+Join them with **`+`** (or `,` / `;`) anywhere a model path is accepted:
 
 ```bat
 main.py cli song.wav --engine onnx --model "backbone.onnx+spec_head.onnx"

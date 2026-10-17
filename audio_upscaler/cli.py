@@ -11,7 +11,7 @@ from .audio_io import INPUT_EXTENSIONS, OUTPUT_FORMATS, available_output_formats
 from .engines import engine_status
 from .pipeline import JobSettings, collect_audio_with_roots, run_batch
 
-_SAMPLE_RATES = (44_100, 48_000, 88_200, 96_000, 176_400, 192_000)
+_SAMPLE_RATES = (0, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000)
 
 
 def _preset_keys() -> list[str]:
@@ -30,7 +30,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("inputs", nargs="*", help="audio files or folders")
     p.add_argument("-o", "--out", type=Path, default=None,
                    help="output directory (default: same as source)")
-    p.add_argument("--sr", type=int, default=48_000, choices=_SAMPLE_RATES)
+    p.add_argument("--sr", type=int, default=48_000, choices=_SAMPLE_RATES,
+                   help="target sample rate; 0 = keep the source rate")
     p.add_argument("--format", default="FLAC", metavar="FMT",
                    help="output format: " + ", ".join(OUTPUT_FORMATS))
     p.add_argument("--bit-depth", type=int, default=24, choices=(16, 24, 32))
@@ -88,6 +89,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="check GitHub for a newer release and exit")
     p.add_argument("--get-starter-model", action="store_true",
                    help="download the starter BWE model into models/ and exit")
+    p.add_argument("--list-models", nargs="?", const="models", default=None,
+                   metavar="FOLDER",
+                   help="list .onnx models (default: models/) with detected "
+                        "kind and exit")
+    p.add_argument("--inspect-model", type=Path, default=None, metavar="PATH",
+                   help="print full I/O report + sidecar template for a model "
+                        "and exit (chain with + if split)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="show input -> output mapping (and skips) without "
+                        "processing anything")
+    p.add_argument("--skip-existing", action="store_true",
+                   help="skip files whose output already exists (resume-safe)")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
 
@@ -158,6 +171,32 @@ def run_cli(argv: list[str]) -> int:
         p = ensure_starter_model()
         print(p if p else "download failed")
         return 0 if p else 1
+    if args.list_models:
+        from .engines.onnx_engine import OnnxEngine
+
+        folder = Path(args.list_models)
+        models = sorted(folder.glob("*.onnx"))
+        if not models:
+            print(f"No .onnx models found in {folder.resolve()}")
+            return 1
+        print(f"Models in {folder} (pass --model plus --engine onnx; join "
+              "split models with +):\n")
+        for m in models:
+            try:
+                kind = OnnxEngine.inspect(m)
+            except Exception as exc:
+                kind = f"? ({exc})"
+            print(f"  {m.name:<40} [{kind}]")
+        return 0
+    if args.inspect_model:
+        from .engines.onnx_engine import OnnxEngine
+
+        try:
+            print(OnnxEngine.inspect_report(args.inspect_model))
+        except Exception as exc:
+            print(f"Error: {exc}")
+            return 1
+        return 0
 
     # ---- collect files --------------------------------------------------
     files, roots = collect_audio_with_roots(args.inputs or [])
@@ -193,6 +232,7 @@ def run_cli(argv: list[str]) -> int:
             keep_tree=args.keep_tree, workers=args.workers,
             copy_metadata=not args.no_metadata,
             use_dml=not args.no_gpu,
+            skip_existing=args.skip_existing,
         )
 
     def header(extra: str = "") -> None:
@@ -204,11 +244,13 @@ def run_cli(argv: list[str]) -> int:
     def report_summary(summary) -> int:
         print("\n--- summary ---")
         for rep in summary.reports:
-            mark = "OK " if rep.ok else "ERR"
+            mark = "OK " if rep.ok else ("CANC" if rep.cancelled else "ERR")
             dst = rep.output.name if rep.output else "-"
             print(f"  [{mark}] {rep.source.name} -> {dst}")
             if rep.ok:
                 print(f"       {rep.stats_line()}  ({rep.elapsed_s:.1f}s)")
+                if rep.message != "ok":
+                    print(f"       {rep.message}")
             else:
                 print(f"       {rep.message}")
         print(f"\n{summary.succeeded}/{len(summary.reports)} succeeded.")
@@ -249,6 +291,28 @@ def run_cli(argv: list[str]) -> int:
             return code
 
         settings = settings_for(args.preset, args.suffix)
+
+        if args.dry_run:
+            from .pipeline import output_path_for
+
+            print(f"Dry run - {len(files)} file(s), engine={args.engine}, "
+                  f"sr={args.sr or 'keep source'}, fmt={fmt}:\n")
+            will_skip = 0
+            for f in files:
+                out = output_path_for(f, settings, roots.get(f),
+                                      settings.preset, dedupe=False)
+                exists = out.exists()
+                if exists and settings.skip_existing:
+                    will_skip += 1
+                    mark = "  [exists - will skip]"
+                elif exists:
+                    mark = "  [exists - will get _2 name]"
+                else:
+                    mark = ""
+                print(f"  {f.name}  ->  {out}{mark}")
+            print(f"\n{len(files)} file(s), {will_skip} skipped by "
+                  "--skip-existing, 0 processed (dry run).")
+            return 0
 
         if args.watch:
             # poll folders for new files and process them as they appear

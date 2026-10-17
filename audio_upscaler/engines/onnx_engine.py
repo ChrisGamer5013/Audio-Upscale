@@ -109,6 +109,31 @@ def _embedding_input_hint(inp) -> bool:
     )
 
 
+def split_models(raw) -> list[Path]:
+    """Split a model spec into paths. Separators: '+', ',', ';' (any mix),
+    so `a.onnx+b.onnx`, `a.onnx, b.onnx` and `a.onnx;b.onnx` all chain."""
+    import re as _re
+
+    return [Path(p.strip()) for p in _re.split(r"[+;,]", str(raw))
+            if p and p.strip()]
+
+
+_WAVE_NAME_HINTS = ("wave", "audio", "trim", "out_sig", "signal")
+
+
+def _is_complex_pair(outs: list) -> bool:
+    """(real, imag) style spectrogram pair vs a model with aux outputs."""
+    if len(outs) < 2:
+        return False
+    n0 = (outs[0].name or "").lower()
+    n1 = (outs[1].name or "").lower()
+    if "real" in n0 or "imag" in n1 or "phase" in n1 or "mag" in n0:
+        return True
+    if len(outs) > 2:
+        return False
+    return not any(h in n0 for h in _WAVE_NAME_HINTS)
+
+
 def _classify_io(inp, outs: list) -> str:
     i_spec = _spectral_hint(inp.name, inp.shape or [])
     oshape = list(outs[0].shape or [])
@@ -117,7 +142,7 @@ def _classify_io(inp, outs: list) -> str:
     o_wave = rank_o in (2, 3) and not o_spec
     mel = _bin_kind(inp.shape or [], inp.name) == "mel"
 
-    if len(outs) >= 2:
+    if _is_complex_pair(list(outs)):
         # (real, imag) pair -> complex spectrogram reconstruction
         if i_spec:
             return "mel2stft" if mel else "stft2stft"
@@ -131,14 +156,17 @@ def _classify_io(inp, outs: list) -> str:
     return "waveform"
 
 
+_SPEC_KEYS = {"sr", "sample_rate", "n_fft", "hop", "win", "n_mels",
+              "fmin", "fmax", "power", "log", "top_db", "gl_iters"}
+
+
 class OnnxEngine:
     name = "onnx"
 
     def __init__(self, model_path: str | Path, device_id: int = 0,
                  use_dml: bool = True):
         self.ort = _import_ort()
-        raw = str(model_path)
-        parts = [Path(p.strip()) for p in raw.split("+") if p.strip()]
+        parts = split_models(model_path)
         if not parts:
             raise FileNotFoundError("No model given.")
         for p in parts:
@@ -172,10 +200,14 @@ class OnnxEngine:
 
         self.ins = self.sessions[0].get_inputs()
         self.outs = self.sessions[-1].get_outputs()
-        self.complex_pair = len(self.outs) >= 2
+        self.complex_pair = _is_complex_pair(list(self.outs))
 
-        # sidecar config merged from all chain stages (later stages override)
+        # sidecar config: model metadata first, then <model>.json files
+        # (JSON sidecars override; later chain stages override earlier ones)
         self.sidecar: dict = {}
+        for p in parts:
+            for k, v in self._metadata_props(p).items():
+                self.sidecar.setdefault(k, v)
         for p in parts:
             side = p.with_suffix(".json")
             if side.is_file():
@@ -189,11 +221,33 @@ class OnnxEngine:
         self.kind = self.sidecar.get("kind") or _classify_io(self.ins[0],
                                                              list(self.outs))
         self.input_rank = len(self.ins[0].shape or [])
+        ishape = list(self.ins[0].shape or [])
+        self.stereo_in = (self.kind == "waveform" and self.input_rank == 3
+                          and len(ishape) > 1 and ishape[1] == 2)
         self.patch_mode = self._detect_patch_mode()
         self._fixed_len = self._fixed_time_len()
         self._spec_params: SpecParams | None = None
         self._guard_embedding_only()
         self._probe()
+
+    @staticmethod
+    def _metadata_props(path: Path) -> dict:
+        """Read key/value pairs some exporters embed in the ONNX model."""
+        try:
+            import onnx
+        except ImportError:
+            return {}
+        try:
+            m = onnx.load(str(path), load_external_data=False)
+        except Exception:
+            return {}
+        d: dict = {}
+        for kv in getattr(m, "metadata_props", []) or []:
+            try:
+                d[kv.key] = json.loads(kv.value)
+            except Exception:
+                d[kv.key] = kv.value
+        return d
 
     def _guard_embedding_only(self) -> None:
         """A backbone/latent model alone cannot output audio - tell the user
@@ -233,7 +287,7 @@ class OnnxEngine:
         ort = _import_ort()
         sopts = ort.SessionOptions()
         sopts.log_severity_level = 3
-        parts = [Path(p.strip()) for p in str(model_path).split("+") if p.strip()]
+        parts = split_models(model_path)
         first = ort.InferenceSession(str(parts[0]), sess_options=sopts,
                                      providers=["CPUExecutionProvider"])
         last = first if len(parts) == 1 else ort.InferenceSession(
@@ -246,6 +300,72 @@ class OnnxEngine:
         if _embedding_hint(list(outs)):
             return "backbone (chain with head: a.onnx+b.onnx)"
         return _classify_io(ins[0], list(outs))
+
+    @classmethod
+    def inspect_report(cls, model_path: str | Path) -> str:
+        """Human-readable I/O report + suggested sidecar (GUI/CLI helper)."""
+        ort = _import_ort()
+        sopts = ort.SessionOptions()
+        sopts.log_severity_level = 3
+        parts = split_models(model_path)
+        lines: list[str] = [f"model chain: {len(parts)} stage(s)"]
+        for p in parts:
+            if not p.is_file():
+                return f"Model not found: {p}"
+            s = ort.InferenceSession(str(p), sess_options=sopts,
+                                     providers=["CPUExecutionProvider"])
+            lines.append(f"\n[{p.name}]")
+            for t in s.get_inputs():
+                lines.append(f"  in : {t.name:<22} {list(t.shape)}")
+            for t in s.get_outputs():
+                lines.append(f"  out: {t.name:<22} {list(t.shape)}")
+            del s
+        try:
+            kind = cls.inspect(str(model_path))
+        except Exception as exc:
+            kind = f"? ({exc})"
+        lines.append(f"\ndetected kind: {kind}")
+        lines.append("\nsuggested sidecar - save next to the model as "
+                     f"'{parts[0].stem}.json' to override parameters:\n"
+                     f"{cls.sidecar_template(model_path)}")
+        return "\n".join(lines)
+
+    @classmethod
+    def sidecar_template(cls, model_path: str | Path) -> str:
+        """Default sidecar JSON for a model (kind + geometry guesses)."""
+        try:
+            kind = cls.inspect(model_path)
+        except Exception:
+            kind = "generic"
+        if any(w in kind for w in ("backbone", "head", "chain after")):
+            kind = "generic"
+        shape: list = []
+        name = ""
+        try:
+            ort = _import_ort()
+            sopts = ort.SessionOptions()
+            sopts.log_severity_level = 3
+            parts = split_models(model_path)
+            s = ort.InferenceSession(str(parts[0]), sess_options=sopts,
+                                     providers=["CPUExecutionProvider"])
+            m = s.get_inputs()[0]
+            shape, name = list(m.shape or []), (m.name or "")
+            del s
+        except Exception:
+            pass
+        dims = _bin_dims(shape)
+        bins = next((d for d in dims if d in _MEL_DIMS or d in _STFT_DIMS),
+                    None)
+        data: dict = {"kind": kind, "sample_rate": 48000}
+        if bins in _MEL_DIMS:
+            data.update({"n_mels": bins, "n_fft": 1024, "hop": 256,
+                         "win": 1024, "fmin": 0, "fmax": 8000,
+                         "log": "log10", "top_db": 80})
+        elif bins:
+            n_fft = 2 * (bins - 1)
+            data.update({"n_fft": n_fft, "hop": max(64, n_fft // 4),
+                         "win": n_fft})
+        return json.dumps(data, indent=2)
 
     # ---------------------------------------------------------- shapes
     def _detect_patch_mode(self) -> bool:
@@ -292,11 +412,11 @@ class OnnxEngine:
                 else arr.reshape((-1,))
         return arr.astype(np.float32)
 
-    def _run_chain(self, arr: np.ndarray) -> list[np.ndarray]:
-        """Feed arr through all sessions; returns flattened last outputs."""
+    def _run_chain_raw(self, arr: np.ndarray) -> list[np.ndarray]:
+        """Feed arr through all sessions; returns the raw last-stage outputs
+        (original shapes preserved)."""
         cur = [arr]
         for si, sess in enumerate(self.sessions):
-            n_in = len(sess.get_inputs())
             feed = {}
             for idx, meta in enumerate(sess.get_inputs()):
                 if idx < len(cur):
@@ -313,7 +433,11 @@ class OnnxEngine:
                 feed[meta.name] = a
             cur = [np.asarray(o, dtype=np.float32)
                    for o in sess.run(None, feed)]
-        return [o.reshape(-1) for o in cur]
+        return cur
+
+    def _run_chain(self, arr: np.ndarray) -> list[np.ndarray]:
+        """Feed arr through all sessions; returns flattened last outputs."""
+        return [o.reshape(-1) for o in self._run_chain_raw(arr)]
 
     def _fit_main_input(self, arr: np.ndarray, meta) -> np.ndarray:
         if self.patch_mode:
@@ -330,8 +454,12 @@ class OnnxEngine:
         try:
             if self.kind == "waveform":
                 n = self._fixed_len or 4096
-                x = np.zeros(n, dtype=np.float32)
-                inp = x[None, :] if self.input_rank == 2 else x[None, None, :]
+                if self.stereo_in:
+                    inp = np.zeros((1, 2, n), np.float32)
+                else:
+                    x = np.zeros(n, dtype=np.float32)
+                    inp = (x[None, :] if self.input_rank == 2
+                           else x[None, None, :])
             elif self.patch_mode:
                 shape = [d if isinstance(d, int) else 1
                          for d in (self.ins[0].shape or [])]
@@ -366,6 +494,62 @@ class OnnxEngine:
     def _infer_wave_chunk(self, chunk: np.ndarray) -> np.ndarray:
         inp = chunk[None, :] if self.input_rank == 2 else chunk[None, None, :]
         return self._run_chain(inp)[0]
+
+    def _infer_stereo_chunk(self, chunk: np.ndarray) -> np.ndarray:
+        """chunk (2, T) -> output (chans, T2) for [B, 2, T] waveform models."""
+        raw = self._run_chain_raw(chunk[None])[0]
+        y = np.asarray(raw, dtype=np.float32)
+        if y.ndim >= 3:
+            y = y[0]
+        if y.ndim == 1:
+            y = y[None]
+        return y
+
+    def _wave_stereo(self, x2: np.ndarray) -> tuple[np.ndarray, float]:
+        """Run a stereo (2-channel) waveform model over a (2, n) signal."""
+        chunk_len = self._fixed_len or _CHUNK
+        n = x2.shape[-1]
+        if n == 0:
+            return x2.astype(np.float32), 1.0
+
+        def infer(c2: np.ndarray) -> np.ndarray:
+            if c2.shape[1] < chunk_len:
+                c2 = np.pad(c2, ((0, 0), (0, chunk_len - c2.shape[1])))
+            return self._infer_stereo_chunk(c2)
+
+        if n <= chunk_len:
+            y = infer(x2)
+            ratio = y.shape[1] / chunk_len
+            return y[:, : max(1, int(round(n * ratio)))], ratio
+
+        fade, hop = chunk_len // 4, chunk_len - chunk_len // 4
+        acc = norm = None
+        ratio = 1.0
+        m = 1
+        pos = 0
+        while pos < n:
+            y = infer(x2[:, pos: pos + chunk_len])
+            if acc is None:
+                ratio = y.shape[1] / chunk_len
+                m = y.shape[0]
+                total = int(round(n * ratio)) + int(2 * chunk_len * ratio)
+                acc = np.zeros((m, total), np.float32)
+                norm = np.zeros(total, np.float32)
+            w = np.ones(y.shape[1], np.float32)
+            f = min(int(fade * ratio), y.shape[1] // 2)
+            if f > 0:
+                r = np.linspace(0, 1, f, endpoint=False)
+                if pos > 0:
+                    w[:f] = r
+                if pos + chunk_len < n:
+                    w[-f:] = r[::-1]
+            o = int(round(pos * ratio))
+            acc[:, o: o + y.shape[1]] += y * w
+            norm[o: o + y.shape[1]] += w
+            pos += hop
+        good = norm > 1e-6
+        acc[:, good] /= norm[good]
+        return acc[:, : int(round(n * ratio))], ratio
 
     def _wave_channel(self, x: np.ndarray) -> tuple[np.ndarray, float]:
         chunk_len = self._fixed_len or _CHUNK
@@ -411,7 +595,7 @@ class OnnxEngine:
 
     # ---------------------------------------------------------- spectral
     def _params(self, sr: int) -> SpecParams:
-        if self.sidecar:
+        if _SPEC_KEYS.intersection(self.sidecar):
             return SpecParams.from_json(self.sidecar, sr)
         if self._spec_params is None or self._spec_params.sr != sr:
             bins = self._feature_bins()
@@ -627,13 +811,25 @@ class OnnxEngine:
             y = np.stack(chans)
         else:
             report(0.05, "Running ONNX model")
-            chans, ratio = [], 1.0
-            for ci in range(x.shape[0]):
-                yy, ratio = self._wave_channel(x[ci])
-                chans.append(yy)
-                report(0.05 + 0.85 * (ci + 1) / x.shape[0],
-                       f"ONNX inference (ch {ci + 1}/{x.shape[0]})")
-            y = np.stack(chans)
+            if self.stereo_in:
+                x2 = x if x.shape[0] == 2 else np.repeat(x, 2, axis=0)
+                yb, ratio = self._wave_stereo(x2)
+                notes.append("stereo model ([B, 2, T] input)")
+                if yb.shape[0] == x.shape[0]:
+                    y = yb
+                elif yb.shape[0] >= 2 and x.shape[0] == 1:
+                    y = yb.mean(axis=0, keepdims=True)
+                else:
+                    y = np.repeat(yb[:1], x.shape[0], axis=0)
+                report(0.9, "ONNX inference")
+            else:
+                chans, ratio = [], 1.0
+                for ci in range(x.shape[0]):
+                    yy, ratio = self._wave_channel(x[ci])
+                    chans.append(yy)
+                    report(0.05 + 0.85 * (ci + 1) / x.shape[0],
+                           f"ONNX inference (ch {ci + 1}/{x.shape[0]})")
+                y = np.stack(chans)
             ratio_int = int(round(ratio))
             if ratio_int >= 1 and abs(ratio - ratio_int) < 1e-3:
                 model_sr = sr * ratio_int

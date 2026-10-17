@@ -18,6 +18,11 @@ High-quality audio super-resolution / bandwidth extension for Windows.
 - **Generic ONNX runner:** waveform, mel→mel (Griffin-Lim), mel→wave vocoders,
   STFT mask/complex — auto-detected; `.json` sidecar for custom STFT/mel
   parameters. VRAM-aware model recommender: `main.py cli --recommend-models`.
+  Supports **model chains** (`a.onnx+b.onnx`, also `,` `;`), **stereo
+  `[B,2,T]` waveform models**, **fixed-patch `[1,2,63,257]` denoisers**
+  (sliding window), **aux-output models**, and sidecar values embedded in
+  the ONNX `metadata_props`. GUI *Info* / *Test* / *Sidecar* buttons show a
+  model's I/O report, benchmark it, or create an editable sidecar template.
 - **Extras:** batch queue with drag & drop (incl. dropping `.onnx` models),
   per-file progress, before/after spectrogram PNGs, GUI *and* CLI, cancelling.
 - **v0.2 extras:** declipper, spectral-gate denoiser, mid/side mode,
@@ -26,6 +31,12 @@ High-quality audio super-resolution / bandwidth extension for Windows.
   report per file, ultra resampler, update checker, settings persistence,
   dark/light themes, diagnostics panel, Explorer right-click integration,
   GitHub CI that auto-builds releases, bundled starter BWE model.
+- **v0.3 extras:** skip-existing outputs (resume-safe), `--dry-run` preview,
+  keep-source sample rate (`--sr 0`), model **inspect/list** CLI helpers,
+  queue **move/sort/re-queue failed**, double-click preview, **Log tab**,
+  overall + per-file progress bars with **ETA**, completion sound, watch-folder
+  **auto-start**, remembered window geometry, GPU (DirectML) on/off switch,
+  Force Stop that aborts the current file instantly.
 
 ---
 
@@ -54,6 +65,11 @@ REM v0.2 flags (all also available in the GUI):
 .venv\Scripts\python main.py cli inbox\ --watch 10 -o out\ --auto-preset
 .venv\Scripts\python main.py cli music\ --estimate
 .venv\Scripts\python main.py cli track.wav --name-template "{name}_{sr}k_{preset}"
+REM v0.3 flags (all also available in the GUI):
+.venv\Scripts\python main.py cli --list-models
+.venv\Scripts\python main.py cli --inspect-model models\mysr.onnx
+.venv\Scripts\python main.py cli album\ --dry-run --skip-existing
+.venv\Scripts\python main.py cli loop.wav --sr 0 --preset music
 ```
 
 ### Try it instantly

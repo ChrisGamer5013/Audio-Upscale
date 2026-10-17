@@ -384,6 +384,116 @@ def test_keep_tree_and_requirements_text_exist():
         assert word in txt
 
 
+# ---------------------------------------------------------------- v0.3
+def test_skip_existing_and_keep_source_rate(tmp_path):
+    """--skip-existing reuses existing outputs; --sr 0 keeps the source rate."""
+    x = _sweep(22_050, 0.3)
+    src = tmp_path / "sk.wav"
+    write_audio(src, x, 22_050, fmt="WAV", bit_depth=16)
+    settings = JobSettings(target_sr=48_000, fmt="WAV", out_dir=tmp_path,
+                           preset="music", save_spectrograms=False,
+                           copy_metadata=False)
+    first = run_batch([src], settings)
+    out = first.reports[0].output
+    assert out is not None and out.exists()
+
+    # second run skips it and does not create a _2 duplicate
+    settings2 = JobSettings(target_sr=48_000, fmt="WAV", out_dir=tmp_path,
+                            preset="music", save_spectrograms=False,
+                            copy_metadata=False, skip_existing=True)
+    second = run_batch([src], settings2)
+    rep = second.reports[0]
+    assert rep.ok and rep.message == "skipped (output exists)"
+    assert rep.output == out
+    assert not (out.parent / f"{out.stem}_2{out.suffix}").exists()
+
+    # target_sr=0 keeps the source rate
+    settings3 = JobSettings(target_sr=0, fmt="WAV",
+                            out_dir=tmp_path / "keep", preset="voice",
+                            save_spectrograms=False, copy_metadata=False)
+    third = run_batch([src], settings3)
+    assert third.succeeded == 1
+    _, sr_out = read_audio(third.reports[0].output)
+    assert sr_out == 22_050
+
+
+def test_split_models_separators():
+    from audio_upscaler.engines.onnx_engine import split_models
+
+    parts = split_models("a.onnx+b.onnx, c.onnx;d.onnx")
+    assert [p.name for p in parts] == ["a.onnx", "b.onnx", "c.onnx", "d.onnx"]
+    assert split_models("solo.onnx")[0].name == "solo.onnx"
+
+
+@pytest.mark.skipif(
+    not engine_status()["onnx"].startswith("ready"),
+    reason="onnxruntime not installed",
+)
+def test_onnx_stereo_waveform_model(tmp_path):
+    """[B, 2, T] waveform models get both channels at once."""
+    from audio_upscaler.engines.onnx_engine import OnnxEngine
+
+    m = tmp_path / "stereo.onnx"
+    _make_identity_model(m, [1, 2, None], "stereo_wave")
+    eng = OnnxEngine(m, use_dml=False)
+    assert eng.kind == "waveform" and eng.stereo_in
+
+    x = np.stack([_sweep(22_050, 0.2), _sweep(22_050, 0.2, 300.0, 6000.0)])
+    out = eng.process(x, 22_050, 48_000, get_preset("reference"))
+    assert out.audio.shape[0] == 2 and np.isfinite(out.audio).all()
+
+    mono = eng.process(x[:1], 22_050, 48_000, get_preset("reference"))
+    assert mono.audio.shape[0] == 1 and np.isfinite(mono.audio).all()
+
+
+@pytest.mark.skipif(
+    not engine_status()["onnx"].startswith("ready"),
+    reason="onnxruntime not installed",
+)
+def test_onnx_aux_output_not_treated_as_pair(tmp_path):
+    """A waveform output plus an auxiliary output must stay 'waveform'."""
+    from audio_upscaler.engines.onnx_engine import OnnxEngine
+
+    onnx = pytest.importorskip("onnx")
+    x = onnx.helper.make_tensor_value_info("wave", onnx.TensorProto.FLOAT,
+                                           [1, 1, None])
+    w = onnx.helper.make_tensor_value_info("wave_out", onnx.TensorProto.FLOAT,
+                                           [1, 1, None])
+    a = onnx.helper.make_tensor_value_info("aux", onnx.TensorProto.FLOAT,
+                                           [1, 8])
+    nodes = [onnx.helper.make_node("Identity", ["wave"], ["wave_out"]),
+             onnx.helper.make_node("ReduceMean", ["wave"], ["aux"],
+                                   keepdims=0)]
+    graph = onnx.helper.make_graph(nodes, "g", [x], [w, a])
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    m = tmp_path / "aux.onnx"
+    onnx.save(model, str(m))
+
+    eng = OnnxEngine(m, use_dml=False)
+    assert eng.kind == "waveform" and not eng.complex_pair
+
+
+@pytest.mark.skipif(
+    not engine_status()["onnx"].startswith("ready"),
+    reason="onnxruntime not installed",
+)
+def test_onnx_metadata_props_read(tmp_path):
+    """Exporters can embed sidecar values in ONNX metadata_props."""
+    from audio_upscaler.engines.onnx_engine import OnnxEngine
+
+    onnx = pytest.importorskip("onnx")
+    m = tmp_path / "meta.onnx"
+    _make_identity_model(m, [1, 1, None], "wave")
+    model = onnx.load(str(m))
+    model.metadata_props.add(key="sample_rate", value="22050")
+    onnx.save(model, str(m))
+
+    eng = OnnxEngine(m, use_dml=False)
+    assert eng.sidecar.get("sample_rate") == 22_050
+
+
 if __name__ == "__main__":
     import time
 

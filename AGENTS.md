@@ -10,6 +10,10 @@ Language: Python 3.14 (`.venv`). Working dir is the project root.
   `tools/ffmpeg` via `scripts/install_ffmpeg.py`)
 - GUI: `run_gui.bat`  or  `.venv\Scripts\python main.py`
 - CLI: `.venv\Scripts\python main.py cli --help`
+  (v0.3 helpers: `--list-models [dir]`, `--inspect-model <path>`,
+  `--dry-run`, `--skip-existing`, `--sr 0` = keep source rate)
+- GUI model picker: **Browse** (multi-select = chain), **Chain…** appends
+  further stages, live hint shows stage list / backbone-needs-head warnings;
 - Tests: `.venv\Scripts\python -m pytest tests -q`
 - Demo file: `.venv\Scripts\python scripts\make_demo.py`
 - Train ONNX model: install one of `requirements-train[-nvidia|-amd|-intel].txt`

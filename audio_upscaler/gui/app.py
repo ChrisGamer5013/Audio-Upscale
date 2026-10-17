@@ -10,6 +10,7 @@ import queue
 import re
 import tempfile
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -30,7 +31,8 @@ except ImportError:
     _HAS_DND = False
 
 MODEL_LABELS = {"dsp": "DSP Enhance (built-in)", "onnx": "ONNX (GPU)"}
-_SR_CHOICES = ["44,100", "48,000", "88,200", "96,000", "176,400", "192,000"]
+_SR_CHOICES = ["Keep source", "44,100", "48,000", "88,200", "96,000",
+               "176,400", "192,000"]
 _LOSSY = {"MP3", "OGG", "OPUS"}
 
 
@@ -54,6 +56,12 @@ class App(ctk.CTk):
         self._formats = available_output_formats()
         self._summary = None
         self._out_dir: Path | None = None
+        self._failed: list[Path] = []
+        self._chain_cache: dict[str, str] = {}
+        self._chain_job: str | None = None
+        self._batch_t0: float | None = None
+        self._eta_prev: tuple[float, float] | None = None
+        self._eta_speed: float | None = None
 
         if _HAS_DND:
             try:
@@ -88,7 +96,8 @@ class App(ctk.CTk):
         ("auto_preset", "auto_preset_var"), ("declip", "declip_var"),
         ("mid_side", "ms_var"), ("ultra", "ultra_var"),
         ("keep_tree", "keeptree_var"), ("nometa", "nometa_var"),
-        ("gpu", "use_dml_var"),
+        ("gpu", "use_dml_var"), ("skip_existing", "skip_exist_var"),
+        ("sound", "sound_var"), ("watch_auto", "watch_auto_var"),
     )
 
     def _collect_prefs(self) -> dict:
@@ -102,6 +111,10 @@ class App(ctk.CTk):
             if var is not None:
                 prefs[key] = bool(var.get())
         prefs["queue"] = [str(p) for p in self._files]
+        try:
+            prefs["geometry"] = self.geometry()
+        except Exception:
+            pass
         return prefs
 
     def _load_prefs(self) -> None:
@@ -127,6 +140,11 @@ class App(ctk.CTk):
         try:
             if prefs.get("theme") and prefs["theme"] != "dark":
                 ctk.set_appearance_mode(prefs["theme"])
+        except Exception:
+            pass
+        try:
+            if prefs.get("geometry"):
+                self.geometry(prefs["geometry"])
         except Exception:
             pass
         for q in prefs.get("queue", [])[:200]:
@@ -160,7 +178,12 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(
             left, text="Queue", font=ctk.CTkFont(size=15, weight="bold")
-        ).grid(row=0, column=0, columnspan=4, padx=8, pady=(8, 4), sticky="w")
+        ).grid(row=0, column=0, columnspan=2, padx=8, pady=(8, 4), sticky="w")
+        self.queue_count_lbl = ctk.CTkLabel(
+            left, text="0 items", text_color="#999",
+            font=ctk.CTkFont(size=11))
+        self.queue_count_lbl.grid(row=0, column=2, columnspan=2, padx=8,
+                                  pady=(8, 4), sticky="e")
 
         list_holder = ctk.CTkFrame(left, fg_color="transparent")
         list_holder.grid(row=1, column=0, columnspan=4, sticky="nsew", padx=6)
@@ -169,8 +192,9 @@ class App(ctk.CTk):
 
         self.file_listbox = tk.Listbox(
             list_holder, bg="#2b2b2b", fg="#e0e0e0", highlightthickness=0,
-            selectbackground="#1f6aa5", activestyle="none",
+            selectbackground="#1f6aa5", activestyle="none", selectmode="extended",
         )
+        self.file_listbox.bind("<Double-Button-1>", self._preview_selected)
         scroll = tk.Scrollbar(list_holder, command=self.file_listbox.yview)
         self.file_listbox.config(yscrollcommand=scroll.set)
         self.file_listbox.grid(row=0, column=0, sticky="nsew")
@@ -190,6 +214,16 @@ class App(ctk.CTk):
         for i, (text, cmd) in enumerate(btns):
             btn_fr.grid_columnconfigure(i, weight=1)
             ctk.CTkButton(btn_fr, text=text, command=cmd).grid(
+                row=0, column=i, padx=2, sticky="ew")
+
+        btns2 = [("↑ Up", self._move_up), ("↓ Down", self._move_down),
+                 ("Sort A-Z", self._sort_queue),
+                 ("Re-queue failed", self._requeue_failed)]
+        btn_fr2 = ctk.CTkFrame(left, fg_color="transparent")
+        btn_fr2.grid(row=4, column=0, columnspan=4, sticky="ew", padx=6, pady=(0, 6))
+        for i, (text, cmd) in enumerate(btns2):
+            btn_fr2.grid_columnconfigure(i, weight=1)
+            ctk.CTkButton(btn_fr2, text=text, command=cmd).grid(
                 row=0, column=i, padx=2, sticky="ew")
 
         hint = "Drag & drop files/folders here" if _HAS_DND else "Use the buttons to add audio files"
@@ -240,6 +274,15 @@ class App(ctk.CTk):
         ctk.CTkEntry(mrow, textvariable=self.model_var).pack(side="left", fill="x", expand=True)
         ctk.CTkButton(mrow, text="Browse", width=60, command=self._browse_model).pack(
             side="left", padx=(4, 0))
+        ctk.CTkButton(mrow, text="Chain…", width=58,
+                      command=self._add_chain_stage).pack(side="left", padx=(4, 0))
+        ctk.CTkButton(mrow, text="✕", width=28,
+                      command=self._clear_model).pack(side="left", padx=(4, 0))
+        self.chain_lbl = ctk.CTkLabel(
+            self.model_frame, text="", justify="left", wraplength=300,
+            text_color="#7fb3d5", font=ctk.CTkFont(size=11))
+        self.chain_lbl.pack(anchor="w", pady=(2, 0))
+        self.model_var.trace_add("write", lambda *_: self._on_model_changed())
         hw = list_gpus()
         dev_lbl = ctk.CTkLabel(self.model_frame,
                                text="GPU device index (DirectML)")
@@ -280,6 +323,15 @@ class App(ctk.CTk):
             self.model_frame, text="Model recommendations (VRAM-aware)",
             command=self._show_recommendations,
         ).pack(anchor="w", pady=(6, 0))
+        mrow2 = ctk.CTkFrame(self.model_frame, fg_color="transparent")
+        mrow2.pack(fill="x", pady=(6, 0))
+        model_tools = (("Info", self._model_info), ("Test", self._model_test),
+                       ("Sidecar", self._model_sidecar),
+                       ("Folder", self._open_models_folder))
+        for i, (text, cmd) in enumerate(model_tools):
+            mrow2.grid_columnconfigure(i, weight=1)
+            ctk.CTkButton(mrow2, text=text, command=cmd, height=24).grid(
+                row=0, column=i, padx=2, sticky="ew")
         self._model_pick_map: dict[str, str] = {}
         self.after(300, self._refresh_model_list)
 
@@ -339,13 +391,15 @@ class App(ctk.CTk):
         row_widget(tabs)
         tab_enh = tabs.add("Enhance")
         tab_batch = tabs.add("Batch")
+        tab_log = tabs.add("Log")
         tab_about = tabs.add("About")
-        for t in (tab_enh, tab_batch, tab_about):
+        for t in (tab_enh, tab_batch, tab_log, tab_about):
             t.grid_columnconfigure(0, weight=1)
 
-        # Enhance / Batch / About tabs (methods below)
+        # Enhance / Batch / Log / About tabs (methods below)
         self._build_enhance_tab(tab_enh)
         self._build_batch_tab(tab_batch)
+        self._build_log_tab(tab_log)
         self._build_about_tab(tab_about)
 
         # ---------------- bottom: output + actions ----------------
@@ -386,11 +440,16 @@ class App(ctk.CTk):
         self.progress = ctk.CTkProgressBar(bottom)
         self.progress.grid(row=2, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 2))
         self.progress.set(0.0)
+        self.file_progress = ctk.CTkProgressBar(bottom, height=6,
+                                                progress_color="#4c7fb8")
+        self.file_progress.grid(row=3, column=0, columnspan=3, sticky="ew",
+                                padx=8, pady=(0, 3))
+        self.file_progress.set(0.0)
         self.progress_lbl = ctk.CTkLabel(bottom, text="Ready", text_color="#aaa")
-        self.progress_lbl.grid(row=3, column=0, columnspan=3, sticky="w", padx=8)
+        self.progress_lbl.grid(row=4, column=0, columnspan=3, sticky="w", padx=8)
         self.file_lbl = ctk.CTkLabel(bottom, text="", text_color="#888",
                                      font=ctk.CTkFont(size=11))
-        self.file_lbl.grid(row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+        self.file_lbl.grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
 
         self._on_engine_change(self.engine_label_var.get())
         self._on_fmt_change(None)
@@ -441,24 +500,66 @@ class App(ctk.CTk):
         ctk.CTkSwitch(tab, text="Skip metadata copy",
                       variable=self.nometa_var).grid(
             row=4, column=0, padx=8, pady=3, sticky="w")
+        self.skip_exist_var = tk.BooleanVar(value=False)
+        ctk.CTkSwitch(tab, text="Skip existing outputs (resume-safe)",
+                      variable=self.skip_exist_var).grid(
+            row=5, column=0, padx=8, pady=3, sticky="w")
+        self.sound_var = tk.BooleanVar(value=True)
+        ctk.CTkSwitch(tab, text="Play a sound when a batch finishes",
+                      variable=self.sound_var).grid(
+            row=6, column=0, padx=8, pady=3, sticky="w")
 
         rowb = ctk.CTkFrame(tab, fg_color="transparent")
-        rowb.grid(row=5, column=0, padx=8, pady=4, sticky="ew")
+        rowb.grid(row=7, column=0, padx=8, pady=4, sticky="ew")
         ctk.CTkButton(rowb, text="Estimate", width=80,
                       command=self._show_estimate).pack(side="left")
         ctk.CTkButton(rowb, text="Compare presets", width=110,
                       command=self._compare_presets).pack(side="left", padx=6)
 
         wl = ctk.CTkFrame(tab, fg_color="transparent")
-        wl.grid(row=6, column=0, padx=8, pady=4, sticky="ew")
+        wl.grid(row=8, column=0, padx=8, pady=4, sticky="ew")
         self.watch_var = tk.BooleanVar(value=False)
         ctk.CTkSwitch(wl, text="Watch folder", variable=self.watch_var,
                       command=self._toggle_watch).pack(side="left")
         ctk.CTkButton(wl, text="Pick…", width=52,
                       command=self._pick_watch_dir).pack(side="left", padx=6)
+        self.watch_auto_var = tk.BooleanVar(value=False)
+        ctk.CTkSwitch(wl, text="auto-start on new files",
+                      variable=self.watch_auto_var).pack(side="left", padx=6)
         self.watch_dir: Path | None = None
         self._watch_seen: set[str] = set()
         self._watch_job: str | None = None
+
+    def _build_log_tab(self, tab) -> None:
+        top = ctk.CTkFrame(tab, fg_color="transparent")
+        top.grid(row=0, column=0, padx=8, pady=(4, 0), sticky="ew")
+        ctk.CTkButton(top, text="Clear", width=60,
+                      command=self._clear_log).pack(side="right")
+        self.log_box = ctk.CTkTextbox(tab, wrap="word",
+                                      font=ctk.CTkFont(size=11))
+        self.log_box.grid(row=1, column=0, padx=8, pady=4, sticky="nsew")
+        tab.grid_rowconfigure(1, weight=1)
+        self.log_box.configure(state="disabled")
+
+    def _clear_log(self) -> None:
+        try:
+            self.log_box.configure(state="normal")
+            self.log_box.delete("0.0", "end")
+            self.log_box.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _log(self, text: str) -> None:
+        box = getattr(self, "log_box", None)
+        if box is None:
+            return
+        try:
+            box.configure(state="normal")
+            box.insert("end", f"{time.strftime('%H:%M:%S')}  {text}\n")
+            box.see("end")
+            box.configure(state="disabled")
+        except Exception:
+            pass
 
     def _build_about_tab(self, tab) -> None:
         ctk.CTkButton(tab, text="Diagnostics (copy for bug reports)",
@@ -597,6 +698,62 @@ class App(ctk.CTk):
         self.file_listbox.delete(0, "end")
         for p in self._files:
             self.file_listbox.insert("end", str(p))
+        try:
+            self.queue_count_lbl.configure(
+                text=f"{len(self._files)} item(s)")
+        except Exception:
+            pass
+
+    def _move_up(self) -> None:
+        sel = set(self.file_listbox.curselection())
+        if not sel:
+            return
+        for i in sorted(sel):
+            if i > 0 and (i - 1) not in sel:
+                self._files[i - 1], self._files[i] = \
+                    self._files[i], self._files[i - 1]
+        self._refresh_list()
+        for i in sorted(sel):
+            self.file_listbox.selection_set(max(0, i - 1))
+
+    def _move_down(self) -> None:
+        sel = set(self.file_listbox.curselection())
+        if not sel:
+            return
+        for i in sorted(sel, reverse=True):
+            if i < len(self._files) - 1 and (i + 1) not in sel:
+                self._files[i + 1], self._files[i] = \
+                    self._files[i], self._files[i + 1]
+        self._refresh_list()
+        for i in sorted(sel):
+            self.file_listbox.selection_set(
+                min(len(self._files) - 1, i + 1))
+
+    def _sort_queue(self) -> None:
+        self._files.sort(key=lambda p: str(p).lower())
+        self._refresh_list()
+
+    def _requeue_failed(self) -> None:
+        if not self._failed:
+            messagebox.showinfo("Re-queue", "No failed files from the last run.")
+            return
+        added = 0
+        for p in self._failed:
+            if p not in self._files:
+                self._files.append(p)
+                added += 1
+        self._failed = []
+        self._refresh_list()
+        self.progress_lbl.configure(text=f"Re-queued {added} failed file(s)")
+
+    def _preview_selected(self, _event=None) -> None:
+        sel = self.file_listbox.curselection()
+        if not sel:
+            return
+        src = self._files[sel[0]]
+        if src.is_file():
+            threading.Thread(target=self._preview_worker, args=(src,),
+                             daemon=True).start()
 
     def _remove_selected(self) -> None:
         sel = list(self.file_listbox.curselection())
@@ -632,11 +789,161 @@ class App(ctk.CTk):
 
     def _browse_model(self) -> None:
         paths = filedialog.askopenfilenames(
-            title="Select ONNX model(s) — multiple = chain",
+            title="Select ONNX model(s) — multiple = chain (e.g. backbone + head)",
             filetypes=[("ONNX model", "*.onnx")])
         if paths:
             self.model_var.set(
                 "+".join(str(Path(p)) for p in paths))
+
+    def _add_chain_stage(self) -> None:
+        """Append one or more models to the current spec as chain stages."""
+        from ..engines.onnx_engine import split_models
+
+        paths = filedialog.askopenfilenames(
+            title="Add model stage(s) to the chain (fed in order)",
+            filetypes=[("ONNX model", "*.onnx")])
+        if not paths:
+            return
+        parts = [str(p) for p in split_models(self.model_var.get())]
+        parts += [str(Path(p)) for p in paths]
+        self.model_var.set("+".join(parts))
+
+    def _clear_model(self) -> None:
+        self.model_var.set("")
+
+    def _on_model_changed(self) -> None:
+        """Debounced chain hint refresh (inspect() opens sessions)."""
+        if self._chain_job:
+            try:
+                self.after_cancel(self._chain_job)
+            except Exception:
+                pass
+        self._chain_job = self.after(500, self._update_chain_hint)
+
+    def _update_chain_hint(self) -> None:
+        self._chain_job = None
+        lbl = getattr(self, "chain_lbl", None)
+        if lbl is None:
+            return
+        spec = self.model_var.get().strip()
+        if not spec:
+            lbl.configure(text="")
+            return
+        from ..engines.onnx_engine import split_models
+
+        parts = split_models(spec)
+        if len(parts) > 1:
+            lbl.configure(
+                text_color="#6fcf97",
+                text=f"Chain of {len(parts)} stages: "
+                     + " → ".join(p.stem for p in parts))
+            return
+        hint = self._chain_cache.get(spec)
+        if hint is None:
+            try:
+                from ..engines.onnx_engine import OnnxEngine
+
+                kind = OnnxEngine.inspect(spec)
+            except Exception:
+                kind = "unreadable"
+            hint = kind
+            self._chain_cache[spec] = hint
+        if "backbone" in hint or "head" in hint:
+            lbl.configure(
+                text_color="#e0a030",
+                text=f"{parts[0].stem}: {hint}\nClick Chain… to add the "
+                     "other stage.")
+        else:
+            lbl.configure(text_color="#7fb3d5", text=f"kind: {hint}")
+
+    def _selected_model_spec(self) -> str | None:
+        spec = self.model_var.get().strip()
+        if spec:
+            return spec
+        messagebox.showinfo("Model", "Pick a model first (Browse or drag & drop).")
+        return None
+
+    def _model_info(self) -> None:
+        spec = self._selected_model_spec()
+        if not spec:
+            return
+        from .dialogs import text_dialog_async
+        from ..engines.onnx_engine import OnnxEngine
+
+        text_dialog_async(self, "Model info",
+                          lambda: OnnxEngine.inspect_report(spec),
+                          loading_text="Inspecting model I/O…")
+
+    def _model_sidecar(self) -> None:
+        spec = self._selected_model_spec()
+        if not spec:
+            return
+        from ..engines.onnx_engine import OnnxEngine, split_models
+
+        side = split_models(spec)[0].with_suffix(".json")
+        if not side.exists():
+            try:
+                side.write_text(OnnxEngine.sidecar_template(spec),
+                                encoding="utf-8")
+            except Exception as exc:
+                messagebox.showerror("Sidecar", str(exc))
+                return
+            self._log(f"sidecar created: {side.name}")
+        try:
+            os.startfile(side)
+        except Exception:
+            pass
+        messagebox.showinfo(
+            "Sidecar",
+            f"{side}\n\nEdit the JSON, save, then use 'Test' to verify. "
+            "Delete it to go back to auto-detection.")
+        self._chain_cache.clear()
+        self._refresh_model_list()
+
+    def _open_models_folder(self) -> None:
+        try:
+            os.startfile(_models_dir())
+        except Exception as exc:
+            messagebox.showerror("Models folder", str(exc))
+
+    def _model_test(self) -> None:
+        spec = self._selected_model_spec()
+        if not spec:
+            return
+        settings = self._gather_settings()
+        if settings is None:
+            return
+        self.progress_lbl.configure(text="Testing model on 2s of synthetic audio…")
+        self._log(f"testing model: {spec}")
+
+        def work():
+            try:
+                import numpy as np
+                import time as _t
+                from ..engines.onnx_engine import OnnxEngine
+                from ..presets import get_preset
+
+                eng = OnnxEngine(spec, settings.device_id,
+                                 use_dml=settings.use_dml)
+                t = np.arange(2 * 22050, dtype=np.float64) / 22050.0
+                x = (0.5 * np.sin(2 * np.pi * 440 * t)
+                     + 0.2 * np.sin(2 * np.pi * 1760 * t)).astype(np.float32)
+                t0 = _t.perf_counter()
+                res = eng.process(x[None, :], 22050, 48000,
+                                  get_preset("reference"))
+                dt = _t.perf_counter() - t0
+                rt = (res.audio.shape[-1] / res.sr) / max(dt, 1e-9)
+                self._msg_q.put(("info", (
+                    f"Model '{eng.model_path.name}' is working.\n\n"
+                    f"kind: {eng.kind}\n"
+                    f"speed: 2 s of audio in {dt:.1f} s "
+                    f"({rt:.2f}x realtime on "
+                    f"{'GPU (DirectML)' if settings.use_dml else 'CPU'})\n"
+                    f"output: {res.sr} Hz, {res.audio.shape[0]} ch")))
+            except Exception as exc:
+                self._msg_q.put(("error", f"Model test failed:\n{exc}"))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _browse_outdir(self) -> None:
         d = filedialog.askdirectory(title="Select output folder")
@@ -648,8 +955,9 @@ class App(ctk.CTk):
             os.startfile(self._out_dir)
 
     def _gather_settings(self) -> JobSettings | None:
+        sr_raw = self.sr_var.get().replace(",", "").strip()
         try:
-            sr = int(self.sr_var.get().replace(",", ""))
+            sr = 0 if sr_raw.lower().startswith("keep") else int(sr_raw)
         except ValueError:
             messagebox.showerror("Invalid", "Sample rate is invalid")
             return None
@@ -701,6 +1009,7 @@ class App(ctk.CTk):
             workers=max(1, min(8, _int(self.workers_var, 1))),
             copy_metadata=not self.nometa_var.get(),
             use_dml=self.use_dml_var.get(),
+            skip_existing=self.skip_exist_var.get(),
         )
 
     # ------------------------------------------------- About-tab actions
@@ -747,21 +1056,33 @@ class App(ctk.CTk):
         if not files:
             messagebox.showinfo("Estimate", "Queue is empty.")
             return
+        fmt = self._fmt_key()
+        tmpl = self.template_var.get() or "{name}{suffix}"
+        outdir = self.outdir_var.get().strip()
+        preset = self.preset_var.get()
 
         def load():
             from ..audio_io import read_audio
             from ..dsp import estimate_bandwidth
+            from ..pipeline import JobSettings, output_path_for
 
-            out = [f"{'file':<40} {'in sr':>8} {'dur':>8} {'ch':>3} {'bandwidth':>10}"]
+            probe = JobSettings(fmt=fmt, name_template=tmpl,
+                                out_dir=Path(outdir) if outdir else None)
+            out = [f"{'file':<36} {'in sr':>7} {'dur':>7} {'ch':>3} "
+                   f"{'bandwidth':>9}  planned output"]
             for f in files:
                 try:
                     x, sr = read_audio(f)
                     bw = estimate_bandwidth(x, sr)
+                    planned = output_path_for(f, probe, None, preset,
+                                              dedupe=False)
+                    note = " (exists)" if planned.exists() else ""
                     out.append(
-                        f"{f.name[:40]:<40} {sr:>8} {x.shape[-1] / sr:>6.1f}s "
-                        f"{x.shape[0]:>3} {bw / 1000:>8.1f}k")
+                        f"{f.name[:36]:<36} {sr:>7} {x.shape[-1] / sr:>5.1f}s "
+                        f"{x.shape[0]:>3} {bw / 1000:>7.1f}k  "
+                        f"{planned.name}{note}")
                 except Exception as exc:
-                    out.append(f"{f.name[:40]:<40} ERROR: {exc}")
+                    out.append(f"{f.name[:36]:<36} ERROR: {exc}")
             return "\n".join(out)
 
         text_dialog_async(self, "Estimate", load)
@@ -820,11 +1141,13 @@ class App(ctk.CTk):
             self._watch_seen = {str(f).lower() for f in self._all_audio(self.watch_dir)}
             self._watch_job = self.after(3000, self._watch_tick)
             self.progress_lbl.configure(text=f"Watching {self.watch_dir}")
+            self._log(f"watch folder: {self.watch_dir}")
         else:
             if self._watch_job:
                 self.after_cancel(self._watch_job)
                 self._watch_job = None
             self.progress_lbl.configure(text="Watch stopped")
+            self._log("watch stopped")
 
     def _pick_watch_dir(self) -> None:
         d = filedialog.askdirectory(title="Pick watch folder")
@@ -841,15 +1164,26 @@ class App(ctk.CTk):
     def _watch_tick(self) -> None:
         if not self.watch_var.get() or not self.watch_dir:
             return
+        added = 0
         try:
             for p in self._all_audio(self.watch_dir):
                 key = str(p).lower()
                 if key not in self._watch_seen:
                     self._watch_seen.add(key)
                     self._files.append(p)
-                    self._refresh_list()
+                    added += 1
+            if added:
+                self._refresh_list()
+                self._log(f"watch: +{added} new file(s)")
         except Exception:
             pass
+        try:
+            idle = self._worker is None or not self._worker.is_alive()
+        except Exception:
+            idle = True
+        if added and self.watch_auto_var.get() and idle and self._files:
+            self._log("watch: auto-starting batch")
+            self._start_batch()
         self._watch_job = self.after(3000, self._watch_tick)
 
     # ------------------------------------------------------------------ actions
@@ -874,11 +1208,20 @@ class App(ctk.CTk):
 
         self._cancel.clear()
         self._force.clear()
+        self._batch_t0 = time.time()
+        self._eta_prev = None
+        self._eta_speed = None
+        self._failed = []
         self.start_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
         self.force_btn.configure(state="normal")
+        self.progress.configure(progress_color="#1f6aa5")
         self.progress.set(0.0)
+        self.file_progress.set(0.0)
         self.progress_lbl.configure(text="Starting…")
+        self._log(f"started: {len(self._files)} item(s), engine="
+                  f"{settings.engine_id}, sr={settings.target_sr or 'source'}, "
+                  f"fmt={settings.fmt}, workers={settings.workers}")
 
         self._worker = threading.Thread(
             target=self._worker_run, args=(list(self._files), settings), daemon=True)
@@ -893,7 +1236,7 @@ class App(ctk.CTk):
             return
 
         def cb(i, total, frac, msg, path):
-            self._msg_q.put(("progress", i, total, frac, msg))
+            self._msg_q.put(("progress", i, total, frac, msg, str(path)))
 
         try:
             summary = run_batch(flat, settings, progress=cb,
@@ -906,6 +1249,7 @@ class App(ctk.CTk):
     def _cancel_batch(self) -> None:
         self._cancel.set()
         self.progress_lbl.configure(text="Finishing current file…")
+        self._log("cancel: finishing current file, then stopping")
 
     def _force_stop_batch(self) -> None:
         self._force.set()
@@ -913,6 +1257,7 @@ class App(ctk.CTk):
         self._files.clear()
         self._refresh_list()
         self.progress_lbl.configure(text="Force stopping now…")
+        self._log("FORCE STOP: aborting current file, queue cleared")
 
     def _poll_queue(self) -> None:
         try:
@@ -920,12 +1265,34 @@ class App(ctk.CTk):
                 msg = self._msg_q.get_nowait()
                 kind = msg[0]
                 if kind == "progress":
-                    _, i, total, frac, text = msg
-                    self.progress.set(frac)
+                    _, i, total, frac, text, fname = msg
+                    overall = (i + min(max(frac, 0.0), 1.0)) / max(1, total)
+                    self.progress.set(overall)
+                    self.file_progress.set(frac)
+                    now = time.time()
+                    if self._eta_prev is not None:
+                        d_over = overall - self._eta_prev[0]
+                        d_t = now - self._eta_prev[1]
+                        if d_over > 1e-6 and d_t > 0.25:
+                            sp = d_over / d_t
+                            self._eta_speed = (sp if self._eta_speed is None
+                                               else 0.7 * self._eta_speed + 0.3 * sp)
+                    eta_txt = ""
+                    if self._eta_speed and self._eta_speed > 1e-6 and overall < 1.0:
+                        rem = int((1.0 - overall) / self._eta_speed)
+                        m, s = divmod(rem, 60)
+                        h, m = divmod(m, 60)
+                        eta_txt = (f"  ·  ETA {h:d}:{m:02d}:{s:02d}" if h
+                                   else f"  ·  ETA {m:d}:{s:02d}")
+                    el = int(now - self._batch_t0) if self._batch_t0 else 0
+                    self._eta_prev = (overall, now)
                     self.progress_lbl.configure(
-                        text=f"File {i + 1}/{total} — {text} ({frac * 100:.0f}%)")
-                    self.file_lbl.configure(
-                        text=str(self._files[i]) if i < len(self._files) else "")
+                        text=f"File {i + 1}/{total} — {text}  ·  this file "
+                             f"{frac * 100:.0f}%  ·  total {overall * 100:.0f}%"
+                             f"{eta_txt}  ·  elapsed {el // 60:d}:{el % 60:02d}")
+                    self.file_lbl.configure(text=fname)
+                    if frac >= 1.0:
+                        self._log(f"{text.lower()}: {Path(fname).name}")
                 elif kind == "done":
                     self._summary = msg[1]
                     self.start_btn.configure(state="normal")
@@ -935,26 +1302,52 @@ class App(ctk.CTk):
                     ok = self._summary.succeeded
                     tot = len(self._summary.reports)
                     self.progress.set(1.0)
+                    self.file_progress.set(0.0)
+                    self._failed = [r.source for r in self._summary.reports
+                                    if not r.ok and not r.cancelled]
+                    skipped = sum(1 for r in self._summary.reports
+                                  if r.ok and r.message.startswith("skipped"))
                     if self._summary.cancelled:
+                        self.progress.configure(progress_color="#b98900")
                         self.progress_lbl.configure(
                             text=f"Stopped: {ok}/{tot} processed")
                         self.file_lbl.configure(text="")
+                        self._log(f"stopped: {ok}/{tot} processed, "
+                                  f"{len(self._failed)} failed")
                     else:
+                        color = "#8a2b2b" if self._failed else "#2b8a3e"
+                        self.progress.configure(progress_color=color)
                         self.progress_lbl.configure(
-                            text=f"Done: {ok}/{tot} succeeded")
+                            text=f"Done: {ok}/{tot} succeeded"
+                                 + (f", {skipped} skipped" if skipped else ""))
                         self.file_lbl.configure(text="")
-                        failed = [r for r in self._summary.reports if not r.ok]
                         body = f"{ok}/{tot} files processed."
-                        if failed:
+                        if skipped:
+                            body += f"\n{skipped} skipped (output existed)."
+                        if self._failed:
                             body += "\n\nFailed:\n" + "\n".join(
                                 f"  {r.source.name}: {r.message}"
-                                for r in failed)
+                                for r in self._summary.reports
+                                if not r.ok and not r.cancelled)
                         messagebox.showinfo("Batch finished", body)
+                        self._log(f"finished: {ok}/{tot} ok"
+                                  + (f", {skipped} skipped" if skipped else "")
+                                  + (f", {len(self._failed)} failed"
+                                     if self._failed else ""))
+                    if self.sound_var.get():
+                        try:
+                            import winsound
+
+                            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+                        except Exception:
+                            pass
                 elif kind == "error":
                     self.start_btn.configure(state="normal")
                     self.cancel_btn.configure(state="disabled")
                     self.force_btn.configure(state="disabled")
+                    self.progress.configure(progress_color="#8a2b2b")
                     self.progress_lbl.configure(text=f"Error: {msg[1]}")
+                    self._log(f"ERROR: {msg[1]}")
                     messagebox.showerror("Error", msg[1])
                 elif kind == "preview":
                     self._show_preview(msg[1], msg[2])
