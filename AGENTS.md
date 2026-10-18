@@ -11,7 +11,8 @@ Language: Python 3.14 (`.venv`). Working dir is the project root.
 - GUI: `run_gui.bat`  or  `.venv\Scripts\python main.py`
 - CLI: `.venv\Scripts\python main.py cli --help`
   (v0.3 helpers: `--list-models [dir]`, `--inspect-model <path>`,
-  `--dry-run`, `--skip-existing`, `--sr 0` = keep source rate)
+  `--dry-run`, `--skip-existing`, `--sr 0` = keep source rate,
+  `--passes N` = multi-pass cascade; GUI "Passes" entry in the Batch tab)
 - GUI model picker: **Browse** (multi-select = chain), **Chain…** appends
   further stages, live hint shows stage list / backbone-needs-head warnings;
 - Tests: `.venv\Scripts\python -m pytest tests -q`

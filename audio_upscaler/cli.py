@@ -72,6 +72,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ultra-quality resampler (slower, wider stopband)")
     p.add_argument("--workers", type=int, default=1,
                    help="parallel files (1-8; engines already use all cores/GPU)")
+    p.add_argument("--passes", type=int, default=1, metavar="N",
+                   choices=range(1, 9),
+                   help="multi-pass cascade: upscale the result again up to "
+                        "N times (each pass roughly doubles the rate until "
+                        "--sr is reached; extra passes re-enhance at target)")
     p.add_argument("--compare", metavar="P1,P2", default=None,
                    help="render one output per preset for A/B comparison")
     p.add_argument("--estimate", action="store_true",
@@ -233,6 +238,7 @@ def run_cli(argv: list[str]) -> int:
             copy_metadata=not args.no_metadata,
             use_dml=not args.no_gpu,
             skip_existing=args.skip_existing,
+            passes=args.passes,
         )
 
     def header(extra: str = "") -> None:

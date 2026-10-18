@@ -72,8 +72,9 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
         self.title(f"{APP_NAME}  v{__version__}")
-        self.geometry("1150x740")
-        self.minsize(1000, 680)
+        self.geometry("1180x760")
+        self.minsize(900, 560)
+        self.resizable(True, True)
 
         self._build_ui()
         self._poll_queue()
@@ -87,6 +88,7 @@ class App(ctk.CTk):
         ("sr", "sr_var"), ("fmt", "fmt_var"), ("bit", "bit_var"),
         ("lufs", "lufs_var"), ("denoise", "denoise_var"),
         ("template", "template_var"), ("workers", "workers_var"),
+        ("passes", "passes_var"),
         ("outdir", "outdir_var"), ("model", "model_var"),
         ("device", "device_var"), ("theme", "theme_var"),
         ("accent", "accent_var"),
@@ -167,7 +169,8 @@ class App(ctk.CTk):
 
         main = ctk.CTkFrame(self, fg_color="transparent")
         main.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
-        main.grid_columnconfigure(0, weight=1)
+        main.grid_columnconfigure(0, weight=3, minsize=380)
+        main.grid_columnconfigure(1, weight=2, minsize=340)
         main.grid_rowconfigure(0, weight=1)
 
         # ---------------- left: queue ----------------
@@ -386,9 +389,11 @@ class App(ctk.CTk):
         row_widget(ctk.CTkSwitch(right, text="Save before/after spectrograms",
                                  variable=self.spec_var))
 
-        # ---- tabs: Enhance / Batch / About ----
+        # ---- tabs: Enhance / Batch / Log / About ----
         tabs = ctk.CTkTabview(right, height=250)
         row_widget(tabs)
+        right.grid_rowconfigure(r - 1, weight=1, minsize=140)
+        tabs.grid_configure(sticky="nsew")
         tab_enh = tabs.add("Enhance")
         tab_batch = tabs.add("Batch")
         tab_log = tabs.add("Log")
@@ -455,7 +460,16 @@ class App(ctk.CTk):
         self._on_fmt_change(None)
 
     # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def _scroll_wrap(tab):
+        """Put a scrollable frame inside a tab so it survives small windows."""
+        sf = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        sf.pack(fill="both", expand=True)
+        sf.grid_columnconfigure(0, weight=1)
+        return sf
+
     def _build_enhance_tab(self, tab) -> None:
+        tab = self._scroll_wrap(tab)
         self.auto_preset_var = tk.BooleanVar(value=False)
         ctk.CTkSwitch(tab, text="Auto preset per file",
                       variable=self.auto_preset_var).grid(
@@ -479,11 +493,15 @@ class App(ctk.CTk):
             row=4, column=0, padx=8, pady=3, sticky="w")
 
     def _build_batch_tab(self, tab) -> None:
+        tab = self._scroll_wrap(tab)
         wr = ctk.CTkFrame(tab, fg_color="transparent")
         wr.grid(row=0, column=0, padx=8, pady=3, sticky="ew")
-        ctk.CTkLabel(wr, text="Parallel workers (1-8):").pack(side="left")
+        ctk.CTkLabel(wr, text="Workers (1-8):").pack(side="left")
         self.workers_var = tk.StringVar(value="1")
         ctk.CTkEntry(wr, textvariable=self.workers_var, width=42).pack(side="left", padx=6)
+        ctk.CTkLabel(wr, text="Passes (1-8):").pack(side="left", padx=(10, 0))
+        self.passes_var = tk.StringVar(value="1")
+        ctk.CTkEntry(wr, textvariable=self.passes_var, width=42).pack(side="left", padx=6)
 
         ctk.CTkLabel(tab, text="Name template:  {name} {suffix} {sr} {preset} "
                      "{format} {date} {time}", wraplength=280, justify="left",
@@ -562,6 +580,7 @@ class App(ctk.CTk):
             pass
 
     def _build_about_tab(self, tab) -> None:
+        tab = self._scroll_wrap(tab)
         ctk.CTkButton(tab, text="Diagnostics (copy for bug reports)",
                       command=self._show_diagnostics).grid(
             row=0, column=0, padx=8, pady=4, sticky="ew")
@@ -1007,6 +1026,7 @@ class App(ctk.CTk):
             name_template=self.template_var.get() or "{name}{suffix}",
             keep_tree=self.keeptree_var.get(),
             workers=max(1, min(8, _int(self.workers_var, 1))),
+            passes=max(1, min(8, _int(self.passes_var, 1))),
             copy_metadata=not self.nometa_var.get(),
             use_dml=self.use_dml_var.get(),
             skip_existing=self.skip_exist_var.get(),
@@ -1307,6 +1327,17 @@ class App(ctk.CTk):
                                     if not r.ok and not r.cancelled]
                     skipped = sum(1 for r in self._summary.reports
                                   if r.ok and r.message.startswith("skipped"))
+                    # colour queue rows: green = ok, amber = stopped, red = failed
+                    marks = {r.source: ("#6fcf97" if r.ok else
+                                        ("#e0a030" if r.cancelled else "#e57373"))
+                             for r in self._summary.reports}
+                    for idx, p in enumerate(self._files):
+                        c = marks.get(p)
+                        if c:
+                            try:
+                                self.file_listbox.itemconfig(idx, foreground=c)
+                            except Exception:
+                                pass
                     if self._summary.cancelled:
                         self.progress.configure(progress_color="#b98900")
                         self.progress_lbl.configure(

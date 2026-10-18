@@ -425,6 +425,32 @@ def test_split_models_separators():
     assert split_models("solo.onnx")[0].name == "solo.onnx"
 
 
+def test_multi_pass_cascade(tmp_path):
+    """passes=3 feeds each pass result into the next pass up to the target."""
+    x = _sweep(22_050, 0.3)
+    src = tmp_path / "mp.wav"
+    write_audio(src, x, 22_050, fmt="WAV", bit_depth=16)
+    settings = JobSettings(target_sr=96_000, fmt="WAV", out_dir=tmp_path,
+                           preset="music", save_spectrograms=False,
+                           copy_metadata=False, passes=3)
+    summary = run_batch([src], settings)
+    assert summary.succeeded == 1
+    rep = summary.reports[0]
+    _, sr_out = read_audio(rep.output)
+    assert sr_out == 96_000
+    assert any("passes: 3" in n for n in rep.notes)
+
+    # keep-source rate + passes still works (re-enhance at same rate)
+    settings2 = JobSettings(target_sr=0, fmt="WAV",
+                            out_dir=tmp_path / "keep2", preset="voice",
+                            save_spectrograms=False, copy_metadata=False,
+                            passes=2)
+    summary2 = run_batch([src], settings2)
+    assert summary2.succeeded == 1
+    _, sr2 = read_audio(summary2.reports[0].output)
+    assert sr2 == 22_050
+
+
 @pytest.mark.skipif(
     not engine_status()["onnx"].startswith("ready"),
     reason="onnxruntime not installed",

@@ -32,10 +32,13 @@ High-quality audio super-resolution / bandwidth extension for Windows.
   dark/light themes, diagnostics panel, Explorer right-click integration,
   GitHub CI that auto-builds releases, bundled starter BWE model.
 - **v0.3 extras:** skip-existing outputs (resume-safe), `--dry-run` preview,
-  keep-source sample rate (`--sr 0`), model **inspect/list** CLI helpers,
-  queue **move/sort/re-queue failed**, double-click preview, **Log tab**,
-  overall + per-file progress bars with **ETA**, completion sound, watch-folder
-  **auto-start**, remembered window geometry, GPU (DirectML) on/off switch,
+  keep-source sample rate (`--sr 0`), **multi-pass cascade upscaling**
+  (`--passes N`: each pass roughly doubles the sample rate until the target;
+  extra passes re-enhance at the target), model **inspect/list** CLI helpers,
+  queue **move/sort/re-queue failed** with status colours, double-click
+  preview, **Log tab**, overall + per-file progress bars with **ETA**,
+  completion sound, watch-folder **auto-start**, remembered window geometry,
+  **fully resizable, scrollable UI**, GPU (DirectML) on/off switch,
   Force Stop that aborts the current file instantly.
 
 ---
@@ -70,6 +73,7 @@ REM v0.3 flags (all also available in the GUI):
 .venv\Scripts\python main.py cli --inspect-model models\mysr.onnx
 .venv\Scripts\python main.py cli album\ --dry-run --skip-existing
 .venv\Scripts\python main.py cli loop.wav --sr 0 --preset music
+.venv\Scripts\python main.py cli lowfi.wav --sr 192000 --passes 3
 ```
 
 ### Try it instantly

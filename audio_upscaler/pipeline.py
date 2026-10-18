@@ -49,6 +49,7 @@ class JobSettings:
     copy_metadata: bool = True
     use_dml: bool = True            # False -> force CPU for ONNX models
     skip_existing: bool = False     # don't reprocess files whose output exists
+    passes: int = 1                 # cascade: upscale the result again, 1-8
 
 
 @dataclass
@@ -225,12 +226,36 @@ def process_file(path: Path, settings: JobSettings, engine,
         if from_ms:
             report.notes.append("mid/side mode")
 
-        result = engine.process(
-            proc_in, sr, settings.target_sr, preset, progress=inner,
-        )
-        report.notes.extend(result.notes)
-        y = dsp.from_mid_side(result.audio) if from_ms else result.audio
-        out_sr = result.sr
+        n_pass = max(1, min(8, int(settings.passes or 1)))
+        cur, cur_sr = proc_in, sr
+        engine_notes: list[str] = []
+        for p in range(n_pass):
+            # cascade: each pass roughly doubles the rate until the target
+            # is reached; extra passes re-enhance at the target rate.
+            if p == n_pass - 1:
+                step_sr = settings.target_sr
+            elif settings.target_sr > cur_sr:
+                step_sr = min(cur_sr * 2, settings.target_sr)
+            else:
+                step_sr = cur_sr
+            lo, hi = p / n_pass, (p + 1) / n_pass
+
+            def pass_prog(frac: float, msg: str, lo=lo, hi=hi, p=p) -> None:
+                if n_pass > 1:
+                    msg = f"pass {p + 1}/{n_pass}: {msg}"
+                inner(lo + (hi - lo) * min(max(frac, 0.0), 1.0), msg)
+
+            result = engine.process(cur, cur_sr, step_sr, preset,
+                                    progress=pass_prog)
+            cur, cur_sr = result.audio, result.sr
+            if not engine_notes:
+                engine_notes = list(result.notes)
+        y = dsp.from_mid_side(cur) if from_ms else cur
+        out_sr = cur_sr
+        report.notes.extend(engine_notes)
+        if n_pass > 1:
+            report.notes.append(
+                f"passes: {n_pass} cascade (final {out_sr} Hz)")
         report.seconds_out = y.shape[-1] / out_sr
 
         if settings.lufs_enabled:
