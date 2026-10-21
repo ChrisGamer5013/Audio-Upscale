@@ -90,6 +90,92 @@ Running a backbone **alone** is rejected with a hint to chain it — a
 latent model alone cannot output audio. Sidecars from every stage are
 merged (later stages override on conflicts).
 
+## Model bundles (`model.json`)
+
+Projects often ship several cooperating ONNX files (encoder, decoder,
+vocoder, denoiser, pitch extractor …). Put them in one folder with a small
+manifest and select **the manifest or the folder** — no `+` typing needed:
+
+```
+models/MyVoice/
+  model.json
+  encoder.onnx
+  decoder.onnx
+  vocoder.onnx
+```
+
+```json
+{
+  "name": "my-voice",
+  "sample_rate": 48000,
+  "stages": [
+    {"file": "encoder.onnx", "role": "encoder"},
+    {"file": "decoder.onnx", "role": "decoder"},
+    {"file": "vocoder.onnx", "role": "vocoder", "kind": "mel2wave"}
+  ]
+}
+```
+
+The loader accepts these manifest names (first match in a folder):
+`model.json`, `manifest.json`, `bundle.json`, `config.json`,
+`model-manifest.json`. Stage lists may be under `stages`, `pipeline`,
+`chain`, `models`, `components` or `files` (nested lists such as
+`{"model": {"files": [...]}}` work too). Entries can be plain strings or
+objects using `file` / `path` / `name` / `model` and optionally:
+
+- `role` — label shown by *Info* and the GUI hint (`encoder`, `vocoder` …)
+- `kind` — override auto-detection for that stage
+- `sidecar` — extra params for that stage (same keys as a `.json` sidecar)
+
+Bundle-level keys (`sample_rate`, `n_fft`, `hop`, `n_mels`, `gl_iters` …)
+apply to every stage; a `sidecar` / `params` / `config` object is merged as
+well. Missing files are reported with their names. Tokenizer/config files
+(`.txt`, `.json`, `.model`, `.npy` …) are ignored — only `.onnx` stages are
+loaded. `.keras`/`.h5` stages are rejected with a conversion hint (the Keras
+engine runs a single model; convert to ONNX to use bundles). Stages run
+**in listed order**, each stage's outputs feed the next stage (a linear
+pipeline).
+
+A folder with exactly one `.onnx` and no manifest also works (sherpa-style
+model folders). A folder with several ONNX files but no manifest produces a
+clear error instead of guessing the order.
+
+```bat
+main.py cli song.wav --engine onnx --model models\MyVoice\model.json
+main.py cli --inspect-model models\MyVoice\model.json
+main.py cli --list-models models
+```
+
+## `.keras` / `.h5` models
+
+TensorFlow models are supported through an optional **Keras engine**:
+
+```bat
+setup_env.bat
+.venv\Scripts\pip install -r requirements-keras.txt
+.venv\Scripts\python main.py cli song.wav --engine keras --model models\mysr.keras
+```
+
+GUI: pick the `.keras`/`.h5` file (Browse or drag & drop) — the engine
+switches to **Keras / TensorFlow** automatically. The model is treated as a
+**waveform → waveform** network: audio is fed in chunks (channels-last or
+channels-first is auto-detected from `input_shape`), the observed length
+ratio sets the model sample rate, and the result is resampled to the target
+rate. Fixed-size inputs are run as overlapping windows with crossfades.
+
+TensorFlow must publish wheels for your Python version. If it does not,
+convert the model once (on any machine with TensorFlow) and use the ONNX
+engine, which also gives DirectML/CUDA acceleration:
+
+```bat
+.venv\Scripts\pip install -r requirements-keras.txt
+.venv\Scripts\python scripts\keras_to_onnx.py models\mysr.keras
+```
+
+Multi-input Keras models and non-waveform layouts (text→audio TTS, mel
+models without explicit I/O metadata) are not supported by the Keras engine
+— export those to ONNX with a sidecar instead.
+
 ## GPU (DirectML) notes
 
 The ONNX engine uses DirectML first (AMD / Intel / NVIDIA). Some large

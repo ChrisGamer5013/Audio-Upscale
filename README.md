@@ -2,7 +2,7 @@
 
 High-quality audio super-resolution / bandwidth extension for Windows.
 
-- **Two engines:**
+- **Three engines:**
   - **DSP Enhance** — always-available CPU engine: polyphase resampling,
     SBR-style spectral-mirror bandwidth extension, harmonic exciter,
     noise-matched "air" band, EBU R128 loudness normalize, TPDF dither,
@@ -10,6 +10,9 @@ High-quality audio super-resolution / bandwidth extension for Windows.
   - **ONNX (GPU)** — runs your own `.onnx` super-resolution models through
     **DirectML**, so one codebase accelerates on **AMD, Intel and NVIDIA**
     GPUs, with automatic CPU fallback.
+  - **Keras / TensorFlow** — optional `.keras` / `.h5` waveform models
+    (`pip install -r requirements-keras.txt`), with chunked inference and
+    automatic channel-layout detection. Convert to ONNX for GPU speed.
 - **Formats in:** WAV, FLAC, MP3, OGG, AIFF (+ m4a/aac/wma/opus and video
   audio tracks when ffmpeg is present).
 - **Formats out:** WAV (16/24/32-float), FLAC (16/24), MP3, OGG Vorbis,
@@ -23,6 +26,10 @@ High-quality audio super-resolution / bandwidth extension for Windows.
   (sliding window), **aux-output models**, and sidecar values embedded in
   the ONNX `metadata_props`. GUI *Info* / *Test* / *Sidecar* buttons show a
   model's I/O report, benchmark it, or create an editable sidecar template.
+  **Model bundles**: drop a folder / `model.json` (or `manifest.json` /
+  `config.json`) describing 2-10 cooperating ONNX files (encoder → decoder →
+  vocoder …) and the engine runs the stages in order. Folders with one ONNX
+  also work. See [models/README.md](models/README.md).
 - **Extras:** batch queue with drag & drop (incl. dropping `.onnx` models),
   per-file progress, before/after spectrogram PNGs, GUI *and* CLI, cancelling.
 - **v0.2 extras:** declipper, spectral-gate denoiser, mid/side mode,
@@ -40,6 +47,11 @@ High-quality audio super-resolution / bandwidth extension for Windows.
   completion sound, watch-folder **auto-start**, remembered window geometry,
   **fully resizable, scrollable UI**, GPU (DirectML) on/off switch,
   Force Stop that aborts the current file instantly.
+- **v0.4 extras:** **`.keras` / `.h5` models** via the optional Keras engine
+  (TensorFlow), **multi-file ONNX bundles** coordinated by a `model.json`
+  manifest (encoder/decoder/vocoder pipelines, per-stage roles + kind +
+  sidecar overrides), bundle-aware model list / Info / Test / drag & drop,
+  `--list-models` showing bundles, `scripts/keras_to_onnx.py` converter.
 
 ---
 
@@ -74,6 +86,10 @@ REM v0.3 flags (all also available in the GUI):
 .venv\Scripts\python main.py cli album\ --dry-run --skip-existing
 .venv\Scripts\python main.py cli loop.wav --sr 0 --preset music
 .venv\Scripts\python main.py cli lowfi.wav --sr 192000 --passes 3
+REM v0.4: model bundles + .keras (all also available in the GUI):
+.venv\Scripts\python main.py cli song.wav --engine onnx --model models\MyVoice\model.json
+.venv\Scripts\python main.py cli song.wav --engine keras --model models\mysr.keras
+.venv\Scripts\python main.py cli --inspect-model models\MyVoice\model.json
 ```
 
 ### Try it instantly
@@ -149,7 +165,9 @@ main.py                 entry point (GUI default, `cli` subcommand)
 audio_upscaler/
   dsp.py                all DSP building blocks
   audio_io.py           soundfile + ffmpeg I/O
-  engines/              dsp_engine.py + onnx_engine.py + registry
+  bundles.py            model.json / folder bundle manifest loader
+  engines/              dsp_engine.py + onnx_engine.py + keras_engine.py +
+                        registry
   pipeline.py           batch queue, progress, cancellation
   gui/app.py            CustomTkinter interface
   cli.py                argparse CLI
@@ -159,8 +177,9 @@ audio_upscaler/
 scripts/
   install_ffmpeg.py     ffmpeg auto-installer
   make_demo.py          synthetic test file generator
+  keras_to_onnx.py      .keras/.h5 -> ONNX converter (tf2onnx)
 tests/test_engines.py   pytest suite
-models/                 drop .onnx models here
+models/                 drop .onnx / .keras models and bundles here
 ```
 
 ## Adding an ONNX model
@@ -169,6 +188,10 @@ Put a `.onnx` file in `models\` (or browse to it). Expected format:
 waveform input `float32 [1, samples]` (or `[1, 1, samples]` / `[1, ch, samples]`);
 output same layout. Integer output/input length ratios are handled as
 built-in N× resampling. Long files are processed in overlapping chunks.
+
+Split models (backbone + head) can be chained with `+`, or described in a
+`model.json` bundle together with encoder/decoder/vocoder-style pipelines —
+see [models/README.md](models/README.md).
 
 ## Troubleshooting
 

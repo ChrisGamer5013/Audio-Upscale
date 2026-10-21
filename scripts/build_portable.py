@@ -48,6 +48,9 @@ def pyinstaller_build() -> Path:
         "--collect-all", "tkinterdnd2",
         "--collect-all", "onnxruntime",
         "--exclude-module", "torch",
+        "--exclude-module", "tensorflow",
+        "--exclude-module", "keras",
+        "--exclude-module", "tf2onnx",
         "--exclude-module", "pytest",
     ]
     # portable folder build (fast startup, installer source)

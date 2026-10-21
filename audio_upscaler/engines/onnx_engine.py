@@ -26,6 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from .. import dsp
+from ..bundles import expand_model_spec
 from ..presets import Preset
 from ..spectral import (
     SpecParams, defaults_for_bins, griffin_lim, istft_complex, mel_to_linear_mag,
@@ -110,12 +111,9 @@ def _embedding_input_hint(inp) -> bool:
 
 
 def split_models(raw) -> list[Path]:
-    """Split a model spec into paths. Separators: '+', ',', ';' (any mix),
-    so `a.onnx+b.onnx`, `a.onnx, b.onnx` and `a.onnx;b.onnx` all chain."""
-    import re as _re
-
-    return [Path(p.strip()) for p in _re.split(r"[+;,]", str(raw))
-            if p and p.strip()]
+    """Ordered model paths for a spec: chain text (+ , ;), bundle manifest
+    (model.json / manifest.json / config.json) or a model folder."""
+    return expand_model_spec(raw).paths
 
 
 _WAVE_NAME_HINTS = ("wave", "audio", "trim", "out_sig", "signal")
@@ -166,12 +164,21 @@ class OnnxEngine:
     def __init__(self, model_path: str | Path, device_id: int = 0,
                  use_dml: bool = True):
         self.ort = _import_ort()
-        parts = split_models(model_path)
+        spec = expand_model_spec(model_path)
+        parts = spec.paths
         if not parts:
             raise FileNotFoundError("No model given.")
+        self.bundle_name = spec.bundle_name
+        self.bundle_manifest = spec.manifest
         for p in parts:
             if not p.is_file():
                 raise FileNotFoundError(f"Model not found: {p}")
+            if p.suffix.lower() != ".onnx":
+                raise ValueError(
+                    f"'{p.name}' is not an ONNX model. The ONNX engine only "
+                    "runs .onnx files; convert .keras/.h5 models first with "
+                    "scripts\\keras_to_onnx.py, or switch Engine to "
+                    "Keras / TensorFlow.")
         self.model_paths = parts
         self.model_path = parts[-1]  # display name = last stage
 
@@ -217,6 +224,14 @@ class OnnxEngine:
                     raise RuntimeError(f"Unreadable sidecar {side.name}: {exc}")
                 if isinstance(data, dict):
                     self.sidecar.update(data)
+
+        # bundle manifest options / per-stage overrides win over file sidecars
+        self.sidecar.update(spec.options)
+        for meta in spec.stage_meta:
+            if meta.get("sidecar"):
+                self.sidecar.update(meta["sidecar"])
+            if meta.get("kind"):
+                self.sidecar["kind"] = meta["kind"]
 
         self.kind = self.sidecar.get("kind") or _classify_io(self.ins[0],
                                                              list(self.outs))
@@ -307,14 +322,25 @@ class OnnxEngine:
         ort = _import_ort()
         sopts = ort.SessionOptions()
         sopts.log_severity_level = 3
-        parts = split_models(model_path)
-        lines: list[str] = [f"model chain: {len(parts)} stage(s)"]
-        for p in parts:
+        spec = expand_model_spec(model_path)
+        parts = spec.paths
+        head = f"model chain: {len(parts)} stage(s)"
+        if spec.bundle_name:
+            head = (f"bundle: {spec.bundle_name}"
+                    + (f"  ({spec.manifest.name})" if spec.manifest else "")
+                    + f"  |  {len(parts)} stage(s)")
+        lines: list[str] = [head]
+        roles = [str(m.get("role") or "") for m in spec.stage_meta]
+        for idx, p in enumerate(parts):
             if not p.is_file():
                 return f"Model not found: {p}"
+            if p.suffix.lower() != ".onnx":
+                return (f"'{p.name}' is not an ONNX model. Convert .keras/.h5 "
+                        "models first with scripts\\keras_to_onnx.py.")
             s = ort.InferenceSession(str(p), sess_options=sopts,
                                      providers=["CPUExecutionProvider"])
-            lines.append(f"\n[{p.name}]")
+            role = roles[idx] if idx < len(roles) else ""
+            lines.append(f"\n[{p.name}]" + (f"  role: {role}" if role else ""))
             for t in s.get_inputs():
                 lines.append(f"  in : {t.name:<22} {list(t.shape)}")
             for t in s.get_outputs():

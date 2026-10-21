@@ -1,6 +1,7 @@
 """Engine / I/O / pipeline tests. Run:  python -m pytest tests -q"""
 from __future__ import annotations
 
+import json
 import sys
 import threading
 from pathlib import Path
@@ -518,6 +519,180 @@ def test_onnx_metadata_props_read(tmp_path):
 
     eng = OnnxEngine(m, use_dml=False)
     assert eng.sidecar.get("sample_rate") == 22_050
+
+
+# ---------------------------------------------------------------- v0.4 bundles
+def test_bundle_manifest_expands_and_detects_roles(tmp_path):
+    from audio_upscaler.bundles import expand_model_spec, load_bundle
+
+    pytest.importorskip("onnx")
+    _make_identity_model(tmp_path / "encoder.onnx", [1, 1, None], "wave")
+    _make_identity_model(tmp_path / "vocoder.onnx", [1, 1, None], "wave")
+    manifest = {
+        "name": "demo-voice",
+        "sample_rate": 48_000,
+        "stages": [
+            {"file": "encoder.onnx", "role": "encoder"},
+            {"file": "vocoder.onnx", "role": "vocoder"},
+        ],
+    }
+    path = tmp_path / "model.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    bundle = load_bundle(path)
+    assert bundle is not None
+    assert bundle.name == "demo-voice"
+    assert [s.role for s in bundle.stages] == ["encoder", "vocoder"]
+    assert bundle.options["sample_rate"] == 48_000
+
+    info = expand_model_spec(path)
+    assert [p.name for p in info.paths] == ["encoder.onnx", "vocoder.onnx"]
+    assert info.bundle_name == "demo-voice" and info.manifest == path
+
+
+def test_bundle_folder_single_model_and_missing_file(tmp_path):
+    from audio_upscaler.bundles import expand_model_spec, load_bundle
+
+    pytest.importorskip("onnx")
+    folder = tmp_path / "sherpa-style"
+    folder.mkdir()
+    _make_identity_model(folder / "only.onnx", [1, 1, None], "wave")
+    info = expand_model_spec(folder)
+    assert [p.name for p in info.paths] == ["only.onnx"]
+    assert info.bundle_name == "sherpa-style"
+
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"stages": ["missing.onnx"]}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="missing model file"):
+        load_bundle(bad)
+
+
+def test_bundle_manifest_accepts_dict_and_nested_layouts(tmp_path):
+    from audio_upscaler.bundles import expand_model_spec, load_bundle
+
+    pytest.importorskip("onnx")
+    _make_identity_model(tmp_path / "enc.onnx", [1, 1, None], "wave")
+    _make_identity_model(tmp_path / "dec.onnx", [1, 1, None], "wave")
+    (tmp_path / "vocab.txt").write_text("a", encoding="utf-8")
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps({
+        "model": {"files": {
+            "encoder": "enc.onnx",
+            "decoder": {"path": "dec.onnx", "role": "decoder"},
+            "vocab": "vocab.txt",
+        }}
+    }), encoding="utf-8")
+
+    bundle = load_bundle(path)
+    assert bundle is not None
+    assert [s.path.name for s in bundle.stages] == ["enc.onnx", "dec.onnx"]
+    assert [s.role for s in bundle.stages] == ["encoder", "decoder"]
+    info = expand_model_spec(path)
+    assert [p.name for p in info.paths] == ["enc.onnx", "dec.onnx"]
+
+
+def test_bundle_rejects_keras_stage_with_hint(tmp_path):
+    from audio_upscaler.bundles import load_bundle
+
+    (tmp_path / "stage.keras").write_bytes(b"not a real model")
+    path = tmp_path / "model.json"
+    path.write_text(json.dumps({"stages": ["stage.keras"]}),
+                   encoding="utf-8")
+    with pytest.raises(RuntimeError, match="keras_to_onnx"):
+        load_bundle(path)
+
+
+def test_bundle_folder_without_manifest_hints(tmp_path):
+    from audio_upscaler.bundles import expand_model_spec
+
+    pytest.importorskip("onnx")
+    _make_identity_model(tmp_path / "a.onnx", [1, 1, None], "wave")
+    _make_identity_model(tmp_path / "b.onnx", [1, 1, None], "wave")
+    with pytest.raises(RuntimeError, match="model.json"):
+        expand_model_spec(tmp_path)
+
+
+@pytest.mark.skipif(
+    not engine_status()["onnx"].startswith("ready"),
+    reason="onnxruntime not installed",
+)
+def test_bundle_manifest_runs_as_chain(tmp_path):
+    from audio_upscaler.engines.onnx_engine import OnnxEngine
+
+    pytest.importorskip("onnx")
+    _make_identity_model(tmp_path / "encoder.onnx", [1, 1, None], "wave")
+    _make_identity_model(tmp_path / "denoiser.onnx", [1, 1, None], "wave")
+    (tmp_path / "model.json").write_text(json.dumps({
+        "name": "two-stage",
+        "stages": [{"file": "encoder.onnx", "role": "encoder"},
+                   {"file": "denoiser.onnx", "role": "vocoder"}],
+    }), encoding="utf-8")
+
+    eng = OnnxEngine(tmp_path / "model.json", use_dml=False)
+    assert eng.bundle_name == "two-stage"
+    assert [p.name for p in eng.model_paths] == ["encoder.onnx",
+                                                 "denoiser.onnx"]
+    out = eng.process(_sweep(22_050, 0.2), 22_050, 48_000,
+                      get_preset("reference"))
+    assert out.sr == 48_000 and np.isfinite(out.audio).all()
+
+    report = OnnxEngine.inspect_report(tmp_path / "model.json")
+    assert "bundle: two-stage" in report
+    assert "role: encoder" in report and "role: vocoder" in report
+
+# ---------------------------------------------------------------- v0.4 keras
+class _FakeKerasModel:
+    """Doubles the time axis; enough to exercise the Keras wrapper."""
+
+    def __init__(self, input_shape=(None, None, 1)):
+        self.input_shape = input_shape
+        self.output_shape = input_shape
+
+    def __call__(self, x, training=False):
+        return np.repeat(x, 2, axis=1)
+
+
+def test_keras_engine_fake_model_doubles_samples():
+    from audio_upscaler.engines.keras_engine import KerasEngine
+
+    eng = KerasEngine(model=_FakeKerasModel())
+    assert eng.channels_last and eng.chans == 1
+    out = eng.process(_sweep(22_050, 0.5), 22_050, 44_100,
+                      get_preset("reference"))
+    assert out.sr == 44_100
+    # x2 samples at 2x rate = same duration
+    assert abs(out.audio.shape[-1] - 22_050) <= 2
+    assert np.isfinite(out.audio).all()
+
+
+def test_keras_engine_fixed_window_chunking():
+    from audio_upscaler.engines.keras_engine import KerasEngine
+
+    eng = KerasEngine(model=_FakeKerasModel((None, 1024, 1)))
+    assert eng.fixed_len == 1024
+    out = eng.process(_sweep(22_050, 0.2), 22_050, 44_100,
+                      get_preset("reference"))
+    assert out.audio.shape[-1] == 2 * int(22_050 * 0.2)
+    assert np.isfinite(out.audio).all()
+
+
+def test_keras_engine_stereo_channels_last():
+    from audio_upscaler.engines.keras_engine import KerasEngine
+
+    eng = KerasEngine(model=_FakeKerasModel((None, None, 2)))
+    assert eng.chans == 2 and eng.channels_last
+    x = np.stack([_sweep(22_050, 0.3),
+                  _sweep(22_050, 0.3, 300.0, 6000.0)])
+    out = eng.process(x, 22_050, 44_100, get_preset("reference"))
+    assert out.audio.shape[0] == 2
+    assert out.audio.shape[-1] == 2 * x.shape[-1]
+    assert np.isfinite(out.audio).all()
+
+
+def test_keras_engine_requires_model():
+    with pytest.raises(ValueError, match="Keras"):
+        create_engine("keras")
+    assert "keras" in engine_status()
 
 
 if __name__ == "__main__":

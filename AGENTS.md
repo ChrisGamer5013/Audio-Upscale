@@ -20,6 +20,9 @@ Language: Python 3.14 (`.venv`). Working dir is the project root.
 - Train ONNX model: install one of `requirements-train[-nvidia|-amd|-intel].txt`
   (torch CPU / CUDA / ROCm / XPU), then `main.py train <audio_folder> --epochs N`
   (writes to `models/`; `--device auto|cpu|cuda|xpu|dml`)
+- Keras models: `pip install -r requirements-keras.txt`, then
+  `main.py cli --engine keras --model foo.keras` (waveform models only;
+  optional `scripts/keras_to_onnx.py` conversion, needs tf2onnx)
 - Build portable exe: `.venv\Scripts\python scripts\build_portable.py`
   (PyInstaller onedir + onefile `dist/AudioUpscalerHD-standalone.exe`;
   Inno Setup installer when available)
@@ -35,6 +38,15 @@ Language: Python 3.14 (`.venv`). Working dir is the project root.
   `engines/__init__.py` (`create_engine`, `engine_status`).
 - `audio_upscaler/spectral.py` — numpy/scipy STFT, mel filterbanks,
   Griffin-Lim, `SpecParams` (sidecar `<model>.json` parsing).
+- `audio_upscaler/bundles.py` — multi-model bundle manifests
+  (`model.json` / `manifest.json` / `config.json` / `model-manifest.json`):
+  ordered stages with optional `role`/`kind`/`sidecar`, folder bundles
+  (single `.onnx` or a manifest), `expand_model_spec()` / `load_bundle()` /
+  `manifest_template()`. Linear pipelines only (stage N feeds N+1).
+- `audio_upscaler/engines/keras_engine.py` — optional TensorFlow engine for
+  `.keras`/`.h5` waveform models (lazy guarded import), chunked inference
+  with crossfades, channel-layout auto-detection. `scripts/keras_to_onnx.py`
+  converts to ONNX with tf2onnx (`requirements-keras.txt`).
 - `audio_upscaler/recommendations.py` — VRAM-aware curated ONNX model list
   (CLI `--recommend-models`, GUI button) + `requirements_text()` with
   per-GPU system requirements (shown in GUI About tab and README).
@@ -90,6 +102,9 @@ Language: Python 3.14 (`.venv`). Working dir is the project root.
 (mask or 2-channel complex) | `stft2wave` | `generic`. Override/params via
 `<model>.json` sidecar (see `models/README.md`). Every model gets a probe
 inference at construction — failures must produce a clear, actionable error.
+Model paths may be chains (`a.onnx+b.onnx`), bundle manifests or folders;
+`OnnxEngine` expands them with `bundles.expand_model_spec()` and rejects
+non-`.onnx` stages. `.keras`/`.h5` use `keras_engine.KerasEngine` instead.
 
 ## Notes
 

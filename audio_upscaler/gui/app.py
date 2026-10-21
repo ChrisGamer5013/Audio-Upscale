@@ -30,10 +30,12 @@ try:
 except ImportError:
     _HAS_DND = False
 
-MODEL_LABELS = {"dsp": "DSP Enhance (built-in)", "onnx": "ONNX (GPU)"}
+MODEL_LABELS = {"dsp": "DSP Enhance (built-in)", "onnx": "ONNX (GPU)",
+                "keras": "Keras / TensorFlow"}
 _SR_CHOICES = ["Keep source", "44,100", "48,000", "88,200", "96,000",
                "176,400", "192,000"]
 _LOSSY = {"MP3", "OGG", "OPUS"}
+_MODEL_SUFFIXES = (".onnx", ".keras", ".h5")
 
 
 def _models_dir() -> Path:
@@ -42,6 +44,16 @@ def _models_dir() -> Path:
     d = app_dir() / "models"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _is_model_dir(p: Path) -> bool:
+    """True for a dropped folder that looks like a model / bundle folder."""
+    from ..bundles import MANIFEST_NAMES
+
+    if any((p / name).is_file() for name in MANIFEST_NAMES):
+        return True
+    models = list(p.glob("*.onnx")) + list(p.glob("*.keras")) + list(p.glob("*.h5"))
+    return bool(models)
 
 
 class App(ctk.CTk):
@@ -271,7 +283,7 @@ class App(ctk.CTk):
         # model (shown only for onnx)
         self.model_frame = ctk.CTkFrame(right, fg_color="transparent")
         self.model_var = tk.StringVar()
-        ctk.CTkLabel(self.model_frame, text="ONNX model (.onnx)").pack(anchor="w")
+        ctk.CTkLabel(self.model_frame, text="Model (.onnx / .keras / model.json bundle)").pack(anchor="w")
         mrow = ctk.CTkFrame(self.model_frame, fg_color="transparent")
         mrow.pack(fill="x")
         ctk.CTkEntry(mrow, textvariable=self.model_var).pack(side="left", fill="x", expand=True)
@@ -298,8 +310,10 @@ class App(ctk.CTk):
                       variable=self.use_dml_var).pack(anchor="w", pady=(4, 0))
         ctk.CTkLabel(
             self.model_frame,
-            text="Chain models with + (e.g. backbone.onnx+spec_head.onnx). "
-                 "Uncheck GPU if a big model takes very long to compile.",
+            text="Chain models with + (e.g. backbone.onnx+spec_head.onnx) or "
+                 "drop a model folder / model.json bundle. .keras/.h5 models "
+                 "run with the Keras engine (TensorFlow). Uncheck GPU if a big "
+                 "ONNX model takes very long to compile.",
             wraplength=300, justify="left", text_color="#999",
             font=ctk.CTkFont(size=11)).pack(anchor="w")
         from ..recommendations import gpu_vram_map
@@ -613,7 +627,7 @@ class App(ctk.CTk):
             row=6, column=0, padx=8, sticky="w")
 
     def _on_engine_change(self, label_text: str) -> None:
-        if label_text == MODEL_LABELS["onnx"]:
+        if label_text in (MODEL_LABELS["onnx"], MODEL_LABELS["keras"]):
             self.model_frame.grid(row=3, column=0, padx=10, pady=2, sticky="ew")
         else:
             self.model_frame.grid_forget()
@@ -644,32 +658,76 @@ class App(ctk.CTk):
             p = Path(brace or bare)
             if not p.name:
                 continue
-            if p.suffix.lower() == ".onnx" and p.is_file():
+            if p.is_file() and p.suffix.lower() in _MODEL_SUFFIXES:
+                model_paths.append(p)
+            elif p.is_file() and p.suffix.lower() == ".json":
+                from ..bundles import load_bundle
+
+                try:
+                    is_bundle = load_bundle(p) is not None
+                except Exception:
+                    is_bundle = False
+                if is_bundle:
+                    model_paths.append(p)
+                else:
+                    self._add_paths([p])
+            elif p.is_dir() and _is_model_dir(p):
                 model_paths.append(p)
             else:
                 self._add_paths([p])
         if model_paths:
             self._select_models(model_paths)
 
-    def _select_models(self, models: list[Path]) -> None:
-        """Copy model files into models/ and select them (multiple = chain)."""
+    def _import_model_path(self, p: Path) -> Path | None:
+        """Copy a model file / bundle into models/ and return the copy."""
         import shutil as _sh
 
-        dests: list[Path] = []
-        for p in models:
-            dest = _models_dir() / p.name
-            try:
-                if p.resolve() != dest.resolve():
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    _sh.copy2(p, dest)
-            except Exception as exc:
-                messagebox.showerror("Model import failed", str(exc))
-                continue
-            dests.append(dest)
+        from ..bundles import load_bundle
+
+        dest_root = _models_dir()
+        try:
+            if p.is_dir():
+                src = p.resolve()
+                if src == dest_root.resolve() or dest_root.resolve() in src.parents:
+                    return p
+                dest = dest_root / p.name
+                _sh.copytree(p, dest, dirs_exist_ok=True)
+                return dest
+            if p.suffix.lower() == ".json":
+                bundle = load_bundle(p)
+                if bundle is None:
+                    return None
+                safe = re.sub(r"[^A-Za-z0-9._ -]", "_", bundle.name).strip()
+                dest_dir = dest_root / (safe or p.parent.name)
+                for src in [p, *(s.path for s in bundle.stages)]:
+                    try:
+                        rel = src.resolve().relative_to(p.parent.resolve())
+                    except Exception:
+                        rel = Path(src.name)
+                    dst = dest_dir / rel
+                    if src.resolve() != dst.resolve():
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        _sh.copy2(src, dst)
+                return dest_dir / p.name
+            dest = dest_root / p.name
+            if p.resolve() != dest.resolve():
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                _sh.copy2(p, dest)
+            return dest
+        except Exception as exc:
+            messagebox.showerror("Model import failed", str(exc))
+            return None
+
+    def _select_models(self, models: list[Path]) -> None:
+        """Import models/bundles into models/ and select them (multiple = chain)."""
+        dests = [d for d in (self._import_model_path(p) for p in models) if d]
         if not dests:
             return
-        self.engine_label_var.set(MODEL_LABELS["onnx"])
-        self._on_engine_change(MODEL_LABELS["onnx"])
+        keras = (len(dests) == 1
+                 and dests[0].suffix.lower() in (".keras", ".h5"))
+        target = MODEL_LABELS["keras" if keras else "onnx"]
+        self.engine_label_var.set(target)
+        self._on_engine_change(target)
         if len(dests) == 1:
             self.model_var.set(str(dests[0]))
         else:
@@ -786,17 +844,42 @@ class App(ctk.CTk):
 
     def _refresh_model_list(self) -> None:
         def work():
+            from ..bundles import MANIFEST_NAMES, load_bundle
             from ..engines.onnx_engine import OnnxEngine
 
+            folder = _models_dir()
             items, mapping = [], {}
-            for p in sorted(_models_dir().glob("*.onnx")):
+            for p in sorted(folder.iterdir()):
+                if not (p.is_file() and p.suffix.lower() in _MODEL_SUFFIXES):
+                    continue
                 try:
-                    kind = OnnxEngine.inspect(p)
+                    kind = (OnnxEngine.inspect(p)
+                            if p.suffix.lower() == ".onnx" else "keras")
                 except Exception:
                     kind = "?"
                 label = f"{p.name}  [{kind}]"
                 items.append(label)
                 mapping[label] = str(p)
+            manifests = [folder / n for n in MANIFEST_NAMES
+                         if (folder / n).is_file()]
+            for sub in sorted(x for x in folder.iterdir() if x.is_dir()):
+                for name in MANIFEST_NAMES:
+                    if (sub / name).is_file():
+                        manifests.append(sub / name)
+                        break
+            for m in manifests:
+                try:
+                    bundle = load_bundle(m)
+                except Exception as exc:
+                    bundle, kind = None, f"bundle? {exc}"
+                else:
+                    kind = (f"bundle, {len(bundle.stages)} stages"
+                            if bundle else "")
+                if not kind:
+                    continue
+                label = f"{m.relative_to(folder)}  [{kind}]"
+                items.append(label)
+                mapping[label] = str(m)
             self._msg_q.put(("models", items or ["(none found)"], mapping))
 
         threading.Thread(target=work, daemon=True).start()
@@ -805,25 +888,41 @@ class App(ctk.CTk):
         path = getattr(self, "_model_pick_map", {}).get(label)
         if path:
             self.model_var.set(path)
+            if Path(path).suffix.lower() in (".keras", ".h5"):
+                self.engine_label_var.set(MODEL_LABELS["keras"])
+                self._on_engine_change(MODEL_LABELS["keras"])
 
     def _browse_model(self) -> None:
         paths = filedialog.askopenfilenames(
-            title="Select ONNX model(s) — multiple = chain (e.g. backbone + head)",
-            filetypes=[("ONNX model", "*.onnx")])
-        if paths:
-            self.model_var.set(
-                "+".join(str(Path(p)) for p in paths))
+            title="Select model(s) — multiple ONNX files = chain; "
+                  "model.json bundles and .keras models welcome",
+            filetypes=[("Models", "*.onnx *.keras *.h5 *.json"),
+                       ("ONNX model", "*.onnx"),
+                       ("Keras model", "*.keras *.h5"),
+                       ("Bundle manifest", "*.json"),
+                       ("All files", "*.*")])
+        if not paths:
+            return
+        chosen = [Path(p) for p in paths]
+        self.model_var.set("+".join(str(p) for p in chosen))
+        suffix = chosen[0].suffix.lower()
+        if len(chosen) == 1 and suffix in (".keras", ".h5"):
+            self.engine_label_var.set(MODEL_LABELS["keras"])
+            self._on_engine_change(MODEL_LABELS["keras"])
+        elif len(chosen) == 1 and (suffix == ".json" or chosen[0].is_dir()):
+            self.engine_label_var.set(MODEL_LABELS["onnx"])
+            self._on_engine_change(MODEL_LABELS["onnx"])
 
     def _add_chain_stage(self) -> None:
         """Append one or more models to the current spec as chain stages."""
-        from ..engines.onnx_engine import split_models
+        from ..bundles import expand_model_spec
 
         paths = filedialog.askopenfilenames(
-            title="Add model stage(s) to the chain (fed in order)",
+            title="Add ONNX model stage(s) to the chain (fed in order)",
             filetypes=[("ONNX model", "*.onnx")])
         if not paths:
             return
-        parts = [str(p) for p in split_models(self.model_var.get())]
+        parts = [str(p) for p in expand_model_spec(self.model_var.get()).paths]
         parts += [str(Path(p)) for p in paths]
         self.model_var.set("+".join(parts))
 
@@ -848,21 +947,41 @@ class App(ctk.CTk):
         if not spec:
             lbl.configure(text="")
             return
-        from ..engines.onnx_engine import split_models
+        from ..bundles import expand_model_spec
 
-        parts = split_models(spec)
+        try:
+            info = expand_model_spec(spec)
+        except Exception as exc:
+            lbl.configure(text_color="#e06c75", text=f"bundle error: {exc}")
+            return
+        parts = info.paths
+        if info.bundle_name:
+            stages = " → ".join(p.stem for p in parts)
+            origin = f" ({info.manifest.name})" if info.manifest else ""
+            lbl.configure(
+                text_color="#6fcf97",
+                text=f"Bundle '{info.bundle_name}'{origin} — "
+                     f"{len(parts)} stage(s): {stages}")
+            return
         if len(parts) > 1:
             lbl.configure(
                 text_color="#6fcf97",
                 text=f"Chain of {len(parts)} stages: "
                      + " → ".join(p.stem for p in parts))
             return
+        single = parts[0] if parts else Path(spec)
+        if single.suffix.lower() in (".keras", ".h5"):
+            lbl.configure(
+                text_color="#7fb3d5",
+                text=f"Keras model ({single.name}) — choose Engine: "
+                     "Keras / TensorFlow")
+            return
         hint = self._chain_cache.get(spec)
         if hint is None:
             try:
                 from ..engines.onnx_engine import OnnxEngine
 
-                kind = OnnxEngine.inspect(spec)
+                kind = OnnxEngine.inspect(single)
             except Exception:
                 kind = "unreadable"
             hint = kind
@@ -870,7 +989,7 @@ class App(ctk.CTk):
         if "backbone" in hint or "head" in hint:
             lbl.configure(
                 text_color="#e0a030",
-                text=f"{parts[0].stem}: {hint}\nClick Chain… to add the "
+                text=f"{single.stem}: {hint}\nClick Chain… to add the "
                      "other stage.")
         else:
             lbl.configure(text_color="#7fb3d5", text=f"kind: {hint}")
@@ -887,19 +1006,41 @@ class App(ctk.CTk):
         if not spec:
             return
         from .dialogs import text_dialog_async
-        from ..engines.onnx_engine import OnnxEngine
 
-        text_dialog_async(self, "Model info",
-                          lambda: OnnxEngine.inspect_report(spec),
+        def report() -> str:
+            from ..bundles import expand_model_spec
+
+            info = expand_model_spec(spec)
+            if (len(info.paths) == 1
+                    and info.paths[0].suffix.lower() in (".keras", ".h5")):
+                from ..engines.keras_engine import KerasEngine
+
+                return KerasEngine.inspect_report(info.paths[0])
+            from ..engines.onnx_engine import OnnxEngine
+
+            return OnnxEngine.inspect_report(spec)
+
+        text_dialog_async(self, "Model info", report,
                           loading_text="Inspecting model I/O…")
 
     def _model_sidecar(self) -> None:
         spec = self._selected_model_spec()
         if not spec:
             return
-        from ..engines.onnx_engine import OnnxEngine, split_models
+        from ..bundles import expand_model_spec
+        from ..engines.onnx_engine import OnnxEngine
 
-        side = split_models(spec)[0].with_suffix(".json")
+        info = expand_model_spec(spec)
+        if not info.paths:
+            return
+        first = info.paths[0]
+        if first.suffix.lower() in (".keras", ".h5"):
+            messagebox.showinfo(
+                "Sidecar",
+                "Sidecars apply to ONNX models only.\n\nConvert the .keras "
+                "model to ONNX (scripts\\keras_to_onnx.py) to use sidecars.")
+            return
+        side = first.with_suffix(".json")
         if not side.exists():
             try:
                 side.write_text(OnnxEngine.sidecar_template(spec),
@@ -939,11 +1080,19 @@ class App(ctk.CTk):
             try:
                 import numpy as np
                 import time as _t
-                from ..engines.onnx_engine import OnnxEngine
                 from ..presets import get_preset
 
-                eng = OnnxEngine(spec, settings.device_id,
-                                 use_dml=settings.use_dml)
+                keras = settings.engine_id == "keras"
+                if keras:
+                    from ..engines.keras_engine import KerasEngine
+
+                    eng = KerasEngine(spec, settings.device_id,
+                                      use_dml=settings.use_dml)
+                else:
+                    from ..engines.onnx_engine import OnnxEngine
+
+                    eng = OnnxEngine(spec, settings.device_id,
+                                     use_dml=settings.use_dml)
                 t = np.arange(2 * 22050, dtype=np.float64) / 22050.0
                 x = (0.5 * np.sin(2 * np.pi * 440 * t)
                      + 0.2 * np.sin(2 * np.pi * 1760 * t)).astype(np.float32)
@@ -952,12 +1101,15 @@ class App(ctk.CTk):
                                   get_preset("reference"))
                 dt = _t.perf_counter() - t0
                 rt = (res.audio.shape[-1] / res.sr) / max(dt, 1e-9)
+                label = (getattr(eng, "bundle_name", "")
+                         or getattr(eng, "model_path", Path(spec)).name)
+                accel = ("TensorFlow" if keras else
+                         ("GPU (DirectML)" if settings.use_dml else "CPU"))
                 self._msg_q.put(("info", (
-                    f"Model '{eng.model_path.name}' is working.\n\n"
-                    f"kind: {eng.kind}\n"
+                    f"Model '{label}' is working.\n\n"
+                    f"kind: {getattr(eng, 'kind', 'keras')}\n"
                     f"speed: 2 s of audio in {dt:.1f} s "
-                    f"({rt:.2f}x realtime on "
-                    f"{'GPU (DirectML)' if settings.use_dml else 'CPU'})\n"
+                    f"({rt:.2f}x realtime on {accel})\n"
                     f"output: {res.sr} Hz, {res.audio.shape[0]} ch")))
             except Exception as exc:
                 self._msg_q.put(("error", f"Model test failed:\n{exc}"))
@@ -1214,9 +1366,11 @@ class App(ctk.CTk):
         settings = self._gather_settings()
         if settings is None:
             return
-        if settings.engine_id == "onnx" and not settings.model_path:
-            messagebox.showerror("Missing model",
-                                 "The ONNX engine needs a .onnx model file.")
+        if settings.engine_id in ("onnx", "keras") and not settings.model_path:
+            messagebox.showerror(
+                "Missing model",
+                f"The {settings.engine_id.upper()} engine needs a model file "
+                "(.onnx, .keras/.h5, or a model.json bundle).")
             return
         if settings.out_dir is None:
             settings.out_dir = self._files[0].parent if self._files[0].is_file() else self._files[0]

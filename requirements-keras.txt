@@ -1,0 +1,8 @@
+# Optional: run .keras / .h5 models directly with the Keras engine.
+# TensorFlow must publish wheels for your Python version - if it does not,
+# convert the model once with scripts/keras_to_onnx.py on another machine and
+# use the ONNX engine instead.
+tensorflow-cpu>=2.16
+
+# Optional: .keras / .h5 -> .onnx conversion helper
+tf2onnx>=1.16

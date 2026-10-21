@@ -25,7 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="audio-upscaler",
         description="Audio Upscaler HD - bandwidth extension / audio "
         "super-resolution (DSP engine + generic ONNX GPU engine: "
-        "AMD/Intel/NVIDIA).",
+        "AMD/Intel/NVIDIA; optional Keras/TensorFlow engine).",
     )
     p.add_argument("inputs", nargs="*", help="audio files or folders")
     p.add_argument("-o", "--out", type=Path, default=None,
@@ -37,9 +37,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bit-depth", type=int, default=24, choices=(16, 24, 32))
     p.add_argument("--engine", default="dsp", choices=list(engine_status()))
     p.add_argument("--model", type=Path, default=None,
-                   help=".onnx model path (required for --engine onnx). "
-                        "Chain several models with '+': "
-                        "\"backbone.onnx+spec_head.onnx\"")
+                   help="model path for --engine onnx/keras. Chain ONNX "
+                        "models with '+', or pass a bundle manifest "
+                        "(model.json / manifest.json) describing several "
+                        "stages. .keras/.h5 models need --engine keras")
     p.add_argument("--device", type=int, default=0,
                    help="GPU device index for DirectML")
     p.add_argument("--no-gpu", action="store_true",
@@ -96,11 +97,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="download the starter BWE model into models/ and exit")
     p.add_argument("--list-models", nargs="?", const="models", default=None,
                    metavar="FOLDER",
-                   help="list .onnx models (default: models/) with detected "
+                   help="list models/bundles (default: models/) with detected "
                         "kind and exit")
     p.add_argument("--inspect-model", type=Path, default=None, metavar="PATH",
                    help="print full I/O report + sidecar template for a model "
-                        "and exit (chain with + if split)")
+                        "(ONNX chain, bundle manifest or .keras/.h5) and exit")
     p.add_argument("--dry-run", action="store_true",
                    help="show input -> output mapping (and skips) without "
                         "processing anything")
@@ -177,27 +178,69 @@ def run_cli(argv: list[str]) -> int:
         print(p if p else "download failed")
         return 0 if p else 1
     if args.list_models:
+        from .bundles import MANIFEST_NAMES, load_bundle
+        from .engines.keras_engine import keras_status
         from .engines.onnx_engine import OnnxEngine
 
         folder = Path(args.list_models)
-        models = sorted(folder.glob("*.onnx"))
-        if not models:
-            print(f"No .onnx models found in {folder.resolve()}")
+        if not folder.is_dir():
+            print(f"Folder not found: {folder.resolve()}")
             return 1
-        print(f"Models in {folder} (pass --model plus --engine onnx; join "
-              "split models with +):\n")
-        for m in models:
+        rows: list[tuple[Path, str]] = []
+        for m in sorted(folder.iterdir()):
+            if not (m.is_file() and m.suffix.lower() in (".onnx", ".keras", ".h5")):
+                continue
             try:
-                kind = OnnxEngine.inspect(m)
+                kind = (OnnxEngine.inspect(m) if m.suffix.lower() == ".onnx"
+                        else f"keras ({keras_status()})")
             except Exception as exc:
                 kind = f"? ({exc})"
-            print(f"  {m.name:<40} [{kind}]")
+            rows.append((m, kind))
+        manifests: list[Path] = []
+        for name in MANIFEST_NAMES:
+            cand = folder / name
+            if cand.is_file():
+                manifests.append(cand)
+        for sub in sorted(p for p in folder.iterdir() if p.is_dir()):
+            for name in MANIFEST_NAMES:
+                cand = sub / name
+                if cand.is_file():
+                    manifests.append(cand)
+                    break
+        for cand in manifests:
+            try:
+                bundle = load_bundle(cand)
+            except Exception as exc:
+                rows.append((cand, f"bundle? {exc}"))
+                continue
+            if bundle is None:
+                continue
+            chain = " -> ".join(s.path.name for s in bundle.stages)
+            rows.append((cand, f"bundle '{bundle.name}', "
+                               f"{len(bundle.stages)} stage(s): {chain}"))
+        if not rows:
+            print(f"No .onnx/.keras/.h5 models or bundles found in "
+                  f"{folder.resolve()}")
+            return 1
+        print(f"Models in {folder} (--engine onnx|keras --model <path>; "
+              "chain ONNX files with +):\n")
+        for m, kind in rows:
+            label = str(m.relative_to(folder))
+            print(f"  {label:<44} [{kind}]")
+        if any(m.suffix.lower() in (".keras", ".h5") for m, _ in rows):
+            print(f"\nKeras: {keras_status()}")
         return 0
     if args.inspect_model:
-        from .engines.onnx_engine import OnnxEngine
-
+        p = args.inspect_model
         try:
-            print(OnnxEngine.inspect_report(args.inspect_model))
+            if p.suffix.lower() in (".keras", ".h5"):
+                from .engines.keras_engine import KerasEngine
+
+                print(KerasEngine.inspect_report(p))
+            else:
+                from .engines.onnx_engine import OnnxEngine
+
+                print(OnnxEngine.inspect_report(p))
         except Exception as exc:
             print(f"Error: {exc}")
             return 1
